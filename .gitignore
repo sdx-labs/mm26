@@ -42,5 +42,3 @@ artifacts/
 
 ./data/* 
 data/
-
-.agents/*
