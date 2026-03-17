@@ -1,0 +1,29 @@
+name: mm26-daily-pipeline
+
+on:
+  schedule:
+    - cron: "15 10 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Sync deps
+        run: uv sync --frozen
+      - name: Run Stage 1 pipeline
+        env:
+          CBBD_API_KEY: ${{ secrets.CBBD_API_KEY }}
+        run: uv run python main.py run --mode daily --target-season 2026
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-artifacts
+          path: artifacts/latest

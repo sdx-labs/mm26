@@ -8,3 +8,37 @@ wheels/
 
 # Virtual environments
 .venv
+
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+AGENTS.md
+
+# Environment variable files
+.env
+.env.local
+.env.*.local
+.envrc
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+artifacts/
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Database files
+
+./data/* 
+data/
