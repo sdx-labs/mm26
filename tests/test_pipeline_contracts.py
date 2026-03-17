@@ -16,6 +16,7 @@ from mm26.pipeline import (
     PipelineConfig,
     _aggregate_consensus_lines,
     _build_cbbd_configuration,
+    _load_env_value,
     _normalize_game_team_record,
     _required_kaggle_schemas,
     _validation_split_metadata,
@@ -103,6 +104,10 @@ class TestPipelineContracts(unittest.TestCase):
         config = _build_cbbd_configuration("secret-token")
         self.assertEqual(config.access_token, "secret-token")
         self.assertNotIn("Authorization", config.api_key)
+
+    def test_load_env_value_reads_key_from_dotenv(self) -> None:
+        value = _load_env_value(ROOT, "CBBD_API_KEY")
+        self.assertTrue(bool(value))
 
     def test_consensus_spread_uses_provider_median(self) -> None:
         lines = pl.DataFrame(

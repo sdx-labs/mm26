@@ -191,6 +191,19 @@ def _build_cbbd_configuration(api_key: str) -> Any:
     return cbbd.Configuration(host="https://api.collegebasketballdata.com", access_token=api_key)
 
 
+def _load_env_value(project_root: Path, key: str) -> str | None:
+    env_path = project_root / ".env"
+    if not env_path.exists():
+        return None
+    pattern = re.compile(rf"^{re.escape(key)}\s*=\s*['\"]?(.*?)['\"]?\s*$")
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            value = match.group(1).strip()
+            return value or None
+    return None
+
+
 def _to_utc_datetime(value: date, end_of_day: bool = False) -> datetime:
     clock = time(23, 59, 59) if end_of_day else time(0, 0, 0)
     return datetime.combine(value, clock, tzinfo=UTC)
@@ -434,7 +447,7 @@ def ingest_cbbd(
         },
     }
 
-    resolved_api_key = api_key or os.getenv("CBBD_API_KEY")
+    resolved_api_key = api_key or os.getenv("CBBD_API_KEY") or _load_env_value(config.project_root, "CBBD_API_KEY")
     if not resolved_api_key:
         for dataset in manifest["datasets"].values():
             dataset["reason"] = "CBBD_API_KEY missing"
