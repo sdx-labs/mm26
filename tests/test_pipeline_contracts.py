@@ -1,16 +1,83 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 import sys
+import unittest
+
+import polars as pl
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import unittest
+from mm26.pipeline import (
+    PipelineConfig,
+    _aggregate_consensus_lines,
+    _build_cbbd_configuration,
+    _normalize_game_team_record,
+    _required_kaggle_schemas,
+    _validation_split_metadata,
+    ingest_cbbd,
+)
 
-from mm26.pipeline import _required_kaggle_schemas
+
+class FakeApiBundle:
+    def get_games(self, **kwargs):
+        return [
+            {
+                "gameId": 1,
+                "season": kwargs["season"],
+                "seasonType": "regular",
+                "status": "final",
+                "startDate": "2025-03-01T00:00:00+00:00",
+                "homeTeamId": 10,
+                "homeTeam": "Alpha",
+                "awayTeamId": 20,
+                "awayTeam": "Beta",
+            }
+        ]
+
+    def get_game_teams(self, **kwargs):
+        return [
+            {
+                "gameId": 1,
+                "season": kwargs["season"],
+                "seasonType": "regular",
+                "startDate": "2025-03-01T00:00:00+00:00",
+                "teamId": 10,
+                "team": "Alpha",
+                "opponentId": 20,
+                "opponent": "Beta",
+                "isHome": True,
+                "teamStats": {
+                    "points": {"total": 80},
+                    "fieldGoals": {"made": 28, "attempts": 60},
+                },
+                "opponentStats": {
+                    "points": {"total": 70},
+                },
+            }
+        ]
+
+    def get_lines(self, **kwargs):
+        return [
+            {
+                "gameId": 1,
+                "season": kwargs["season"],
+                "seasonType": "regular",
+                "startDate": "2025-03-01T00:00:00+00:00",
+                "homeTeamId": 10,
+                "homeTeam": "Alpha",
+                "awayTeamId": 20,
+                "awayTeam": "Beta",
+                "lines": [
+                    {"provider": "A", "spread": -3.5, "spreadOpen": -2.5, "overUnder": 145.0},
+                    {"provider": "B", "spread": -4.5, "spreadOpen": -3.5, "overUnder": 146.0},
+                ],
+            }
+        ]
 
 
 class TestPipelineContracts(unittest.TestCase):
@@ -19,6 +86,87 @@ class TestPipelineContracts(unittest.TestCase):
         self.assertIn("MTeams", required)
         self.assertIn("SampleSubmissionStage2", required)
         self.assertIn("MRegularSeasonDetailedResults", required)
+
+    def test_pipeline_config_uses_repo_data_root(self) -> None:
+        config = PipelineConfig(project_root=ROOT)
+        self.assertEqual(config.data_dir, ROOT / "data")
+
+    def test_validation_split_metadata_excludes_holdout_from_train(self) -> None:
+        config = PipelineConfig(project_root=ROOT)
+        split = _validation_split_metadata(config)
+        self.assertEqual(split["train_start_season"], 2006)
+        self.assertEqual(split["train_end_season"], 2024)
+        self.assertEqual(split["holdout_season"], 2025)
+        self.assertEqual(split["prediction_season"], 2026)
+
+    def test_cbbd_configuration_uses_access_token(self) -> None:
+        config = _build_cbbd_configuration("secret-token")
+        self.assertEqual(config.access_token, "secret-token")
+        self.assertNotIn("Authorization", config.api_key)
+
+    def test_consensus_spread_uses_provider_median(self) -> None:
+        lines = pl.DataFrame(
+            {
+                "game_id": [1, 1, 1],
+                "season": [2025, 2025, 2025],
+                "start_date": ["2025-03-01", "2025-03-01", "2025-03-01"],
+                "home_team_id": [10, 10, 10],
+                "away_team_id": [20, 20, 20],
+                "provider": ["A", "B", "C"],
+                "spread": [-5.0, -3.0, None],
+                "spread_open": [-4.0, -2.0, None],
+                "over_under": [141.0, 145.0, None],
+            }
+        )
+        consensus = _aggregate_consensus_lines(lines)
+        row = consensus.to_dicts()[0]
+        self.assertEqual(row["provider_count"], 3)
+        self.assertEqual(row["consensus_home_spread"], -4.0)
+        self.assertEqual(row["consensus_home_spread_open"], -3.0)
+        self.assertEqual(row["consensus_over_under"], 143.0)
+
+    def test_flattened_game_team_record_includes_box_score_fields(self) -> None:
+        row = _normalize_game_team_record(
+            {
+                "gameId": 7,
+                "season": 2025,
+                "seasonType": "regular",
+                "startDate": "2025-03-01T00:00:00+00:00",
+                "teamId": 10,
+                "team": "Alpha",
+                "opponentId": 20,
+                "opponent": "Beta",
+                "teamStats": {
+                    "points": {"total": 80},
+                    "fieldGoals": {"made": 28, "attempts": 60},
+                },
+                "opponentStats": {"points": {"total": 70}},
+            }
+        )
+        self.assertEqual(row["team_stats_points_total"], 80)
+        self.assertEqual(row["team_stats_field_goals_made"], 28)
+        self.assertEqual(row["opponent_stats_points_total"], 70)
+
+    def test_ingest_cbbd_writes_mocked_outputs_without_network(self) -> None:
+        config = PipelineConfig(project_root=ROOT)
+        config.artifacts_dir = ROOT / "artifacts_test"
+        if config.artifacts_dir.exists():
+            shutil.rmtree(config.artifacts_dir)
+        self.addCleanup(lambda: shutil.rmtree(config.artifacts_dir, ignore_errors=True))
+
+        manifest = ingest_cbbd(
+            config,
+            api_key="secret-token",
+            client_factory=lambda _: FakeApiBundle(),
+        )
+
+        self.assertEqual(sorted(manifest["datasets"].keys()), ["game_teams", "games", "lines"])
+        self.assertEqual(manifest["datasets"]["games"]["status"], "ok")
+        self.assertGreater(manifest["datasets"]["game_teams"]["rows"], 0)
+        self.assertGreater(manifest["datasets"]["lines"]["rows"], 0)
+        self.assertTrue((config.bronze_dir / "cbbd" / "games.parquet").exists())
+        self.assertTrue((config.bronze_dir / "cbbd" / "game_teams.parquet").exists())
+        self.assertTrue((config.bronze_dir / "cbbd" / "lines.parquet").exists())
 
 
 if __name__ == "__main__":
