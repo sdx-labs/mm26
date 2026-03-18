@@ -1347,8 +1347,8 @@ def _build_team_season_features(
             pl.mean("opp_tov").alias("avg_opp_tov"),
             # Tempo proxy: possessions ~ FGA - OREB + TO + 0.475 * FTA
             (pl.col("fga") - pl.col("oreb") + pl.col("tov") + pl.col("fta") * 0.475).mean().alias("avg_possessions"),
-            # Last-5 detail
-            pl.col("fgm").tail(5).sum() / pl.col("fga").tail(5).sum(),  # computed below
+            # Last-5 shooting trend
+            (pl.col("fgm").tail(5).sum() / pl.col("fga").tail(5).sum()).alias("last5_fg_pct"),
         ]
         base_aggs.extend(detail_aggs)
 
@@ -1362,7 +1362,7 @@ def _build_team_season_features(
             ((pl.col("total_reb_margin")) / pl.col("games_played")).alias("avg_reb_margin"),
             (pl.col("avg_ast") / pl.col("avg_tov").clip(0.1, None)).alias("ast_to_ratio"),
             (pl.col("avg_stl") + pl.col("avg_blk")).alias("avg_stl_blk"),
-        ).drop("total_reb_margin", "literal")
+        ).drop("total_reb_margin")
     else:
         features = features.with_columns(
             pl.lit(None, dtype=pl.Float64).alias("fg_pct"),
