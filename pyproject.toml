@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cbbd>=1.23.2",
+    "claude>=0.4.11",
     "ipykernel>=7.2.0",
     "kaggle>=2.0.0",
     "matplotlib>=3.10.8",

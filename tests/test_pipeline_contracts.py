@@ -18,6 +18,9 @@ from mm26.pipeline import (
     _build_cbbd_games_clean,
     _build_cbbd_lines_clean,
     _build_cbbd_configuration,
+    _compute_elo_ratings,
+    _compute_heat_scores,
+    _get_pre_tournament_heat,
     _load_env_value,
     _normalize_game_team_record,
     _required_kaggle_schemas,
@@ -107,7 +110,7 @@ class TestPipelineContracts(unittest.TestCase):
     def test_validation_split_metadata_excludes_holdout_from_train(self) -> None:
         config = PipelineConfig(project_root=ROOT)
         split = _validation_split_metadata(config)
-        self.assertEqual(split["train_start_season"], 2016)
+        self.assertEqual(split["train_start_season"], 2003)
         self.assertEqual(split["train_end_season"], 2024)
         self.assertEqual(split["holdout_season"], 2025)
         self.assertEqual(split["prediction_season"], 2026)
@@ -267,6 +270,70 @@ class TestPipelineContracts(unittest.TestCase):
         self.assertIn("team_high", lines_clean.columns)
         self.assertEqual(lines_clean.select("kaggle_home_team_id").to_series()[0], 100)
         self.assertEqual(lines_clean.select("kaggle_away_team_id").to_series()[0], 200)
+
+
+class TestEloAndHeat(unittest.TestCase):
+    """Contract tests for the ELO and heat score engines."""
+
+    def _make_game_fact(self) -> pl.DataFrame:
+        """Minimal game_fact with two games in one season."""
+        return pl.DataFrame({
+            "sex": ["M", "M", "M", "M"],
+            "season": [2025, 2025, 2025, 2025],
+            "day_num": [10, 10, 20, 20],
+            "team_id": [1101, 1102, 1101, 1103],
+            "opp_team_id": [1102, 1101, 1103, 1101],
+            "team_score": [80.0, 70.0, 65.0, 75.0],
+            "opp_score": [70.0, 80.0, 75.0, 65.0],
+            "team_loc": ["H", "A", "A", "H"],
+            "num_ot": [0, 0, 0, 0],
+            "win": [1, 0, 0, 1],
+            "team_low": [1101, 1101, 1101, 1101],
+            "team_high": [1102, 1102, 1103, 1103],
+            "game_key": ["M_2025_10_1101_1102", "M_2025_10_1101_1102",
+                         "M_2025_20_1101_1103", "M_2025_20_1101_1103"],
+        })
+
+    def test_elo_ratings_schema_and_reset(self) -> None:
+        game_fact = self._make_game_fact()
+        elo = _compute_elo_ratings(game_fact)
+        self.assertGreater(elo.height, 0)
+        expected_cols = {"sex", "season", "day_num", "game_key", "team_id",
+                         "elo_before", "elo_after", "expected_win_prob",
+                         "expected_margin", "actual_win", "actual_margin"}
+        self.assertTrue(expected_cols.issubset(set(elo.columns)))
+        # First game: both teams should start at 1500
+        first_game = elo.filter(pl.col("day_num") == 10)
+        self.assertTrue(all(v == 1500.0 for v in first_game["elo_before"].to_list()))
+
+    def test_heat_scores_schema(self) -> None:
+        game_fact = self._make_game_fact()
+        elo = _compute_elo_ratings(game_fact)
+        heat = _compute_heat_scores(elo)
+        self.assertGreater(heat.height, 0)
+        expected_cols = {"sex", "season", "day_num", "team_id",
+                         "heat_delta", "heat_1g", "heat_3g", "heat_5g"}
+        self.assertTrue(expected_cols.issubset(set(heat.columns)))
+
+    def test_pre_tournament_heat_filters_by_day(self) -> None:
+        game_fact = self._make_game_fact()
+        elo = _compute_elo_ratings(game_fact)
+        heat = _compute_heat_scores(elo)
+        pre = _get_pre_tournament_heat(heat, tourney_cutoff_day=132)
+        # All day_nums <= 132 so all teams should appear
+        teams = sorted(pre["team_id"].to_list())
+        self.assertIn(1101, teams)
+
+    def test_elo_empty_input(self) -> None:
+        empty = pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
+            "team_id": pl.Int64, "opp_team_id": pl.Int64,
+            "team_score": pl.Float64, "opp_score": pl.Float64,
+            "team_loc": pl.Utf8, "num_ot": pl.Int64, "win": pl.Int64,
+            "team_low": pl.Int64, "team_high": pl.Int64, "game_key": pl.Utf8,
+        })
+        elo = _compute_elo_ratings(empty)
+        self.assertEqual(elo.height, 0)
 
 
 if __name__ == "__main__":

@@ -11,12 +11,23 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import polars as pl
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover
+    XGBClassifier = None
 
 try:
     from sklearn.linear_model import LogisticRegression
 except Exception:  # pragma: no cover
     LogisticRegression = None
+
+try:
+    from sklearn.isotonic import IsotonicRegression
+except Exception:  # pragma: no cover
+    IsotonicRegression = None
 
 
 @dataclass
@@ -28,7 +39,7 @@ class PipelineConfig:
     run_id: str = field(init=False)
     target_season: int = 2026
     mode: str = "manual"
-    cbbd_history_start: int = 2016
+    cbbd_history_start: int = 2003
     cbbd_history_end: int = 2025
     holdout_season: int = 2025
     daily_completed_lookback_days: int = 3
@@ -611,7 +622,10 @@ def run_validations(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> 
 
 
 def _expand_team_games(detailed: pl.DataFrame, sex: str) -> pl.DataFrame:
-    win_side = detailed.select(
+    # Determine if detailed box-score columns are present
+    has_detail = "WFGM" in detailed.columns
+
+    base_win = [
         pl.lit(sex).alias("sex"),
         pl.col("Season").cast(pl.Int64).alias("season"),
         pl.col("DayNum").cast(pl.Int64).alias("day_num"),
@@ -622,8 +636,8 @@ def _expand_team_games(detailed: pl.DataFrame, sex: str) -> pl.DataFrame:
         pl.col("WLoc").alias("team_loc"),
         pl.col("NumOT").cast(pl.Int64).alias("num_ot"),
         pl.lit(1).alias("win"),
-    )
-    loss_side = detailed.select(
+    ]
+    base_loss = [
         pl.lit(sex).alias("sex"),
         pl.col("Season").cast(pl.Int64).alias("season"),
         pl.col("DayNum").cast(pl.Int64).alias("day_num"),
@@ -634,7 +648,70 @@ def _expand_team_games(detailed: pl.DataFrame, sex: str) -> pl.DataFrame:
         _invert_wloc_expr("WLoc").alias("team_loc"),
         pl.col("NumOT").cast(pl.Int64).alias("num_ot"),
         pl.lit(0).alias("win"),
-    )
+    ]
+
+    if has_detail:
+        detail_win = [
+            pl.col("WFGM").cast(pl.Float64).alias("fgm"),
+            pl.col("WFGA").cast(pl.Float64).alias("fga"),
+            pl.col("WFGM3").cast(pl.Float64).alias("fgm3"),
+            pl.col("WFGA3").cast(pl.Float64).alias("fga3"),
+            pl.col("WFTM").cast(pl.Float64).alias("ftm"),
+            pl.col("WFTA").cast(pl.Float64).alias("fta"),
+            pl.col("WOR").cast(pl.Float64).alias("oreb"),
+            pl.col("WDR").cast(pl.Float64).alias("dreb"),
+            pl.col("WAst").cast(pl.Float64).alias("ast"),
+            pl.col("WTO").cast(pl.Float64).alias("tov"),
+            pl.col("WStl").cast(pl.Float64).alias("stl"),
+            pl.col("WBlk").cast(pl.Float64).alias("blk"),
+            pl.col("WPF").cast(pl.Float64).alias("pf"),
+            pl.col("LFGM").cast(pl.Float64).alias("opp_fgm"),
+            pl.col("LFGA").cast(pl.Float64).alias("opp_fga"),
+            pl.col("LFGM3").cast(pl.Float64).alias("opp_fgm3"),
+            pl.col("LFGA3").cast(pl.Float64).alias("opp_fga3"),
+            pl.col("LFTM").cast(pl.Float64).alias("opp_ftm"),
+            pl.col("LFTA").cast(pl.Float64).alias("opp_fta"),
+            pl.col("LOR").cast(pl.Float64).alias("opp_oreb"),
+            pl.col("LDR").cast(pl.Float64).alias("opp_dreb"),
+            pl.col("LAst").cast(pl.Float64).alias("opp_ast"),
+            pl.col("LTO").cast(pl.Float64).alias("opp_tov"),
+            pl.col("LStl").cast(pl.Float64).alias("opp_stl"),
+            pl.col("LBlk").cast(pl.Float64).alias("opp_blk"),
+            pl.col("LPF").cast(pl.Float64).alias("opp_pf"),
+        ]
+        detail_loss = [
+            pl.col("LFGM").cast(pl.Float64).alias("fgm"),
+            pl.col("LFGA").cast(pl.Float64).alias("fga"),
+            pl.col("LFGM3").cast(pl.Float64).alias("fgm3"),
+            pl.col("LFGA3").cast(pl.Float64).alias("fga3"),
+            pl.col("LFTM").cast(pl.Float64).alias("ftm"),
+            pl.col("LFTA").cast(pl.Float64).alias("fta"),
+            pl.col("LOR").cast(pl.Float64).alias("oreb"),
+            pl.col("LDR").cast(pl.Float64).alias("dreb"),
+            pl.col("LAst").cast(pl.Float64).alias("ast"),
+            pl.col("LTO").cast(pl.Float64).alias("tov"),
+            pl.col("LStl").cast(pl.Float64).alias("stl"),
+            pl.col("LBlk").cast(pl.Float64).alias("blk"),
+            pl.col("LPF").cast(pl.Float64).alias("pf"),
+            pl.col("WFGM").cast(pl.Float64).alias("opp_fgm"),
+            pl.col("WFGA").cast(pl.Float64).alias("opp_fga"),
+            pl.col("WFGM3").cast(pl.Float64).alias("opp_fgm3"),
+            pl.col("WFGA3").cast(pl.Float64).alias("opp_fga3"),
+            pl.col("WFTM").cast(pl.Float64).alias("opp_ftm"),
+            pl.col("WFTA").cast(pl.Float64).alias("opp_fta"),
+            pl.col("WOR").cast(pl.Float64).alias("opp_oreb"),
+            pl.col("WDR").cast(pl.Float64).alias("opp_dreb"),
+            pl.col("WAst").cast(pl.Float64).alias("opp_ast"),
+            pl.col("WTO").cast(pl.Float64).alias("opp_tov"),
+            pl.col("WStl").cast(pl.Float64).alias("opp_stl"),
+            pl.col("WBlk").cast(pl.Float64).alias("opp_blk"),
+            pl.col("WPF").cast(pl.Float64).alias("opp_pf"),
+        ]
+        base_win.extend(detail_win)
+        base_loss.extend(detail_loss)
+
+    win_side = detailed.select(base_win)
+    loss_side = detailed.select(base_loss)
     return pl.concat([win_side, loss_side], how="vertical")
 
 
@@ -973,9 +1050,269 @@ def run_transform(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> di
     }
 
 
-def _build_team_season_features(team_games: pl.DataFrame) -> pl.DataFrame:
+# ---------------------------------------------------------------------------
+# Phase 1 – ELO Engine
+# ---------------------------------------------------------------------------
+
+def _compute_elo_ratings(game_fact: pl.DataFrame, k_factor: float = 20.0,
+                         home_advantage: float = 100.0,
+                         carry_over: float = 0.33) -> pl.DataFrame:
+    """Compute game-by-game ELO ratings with MOV multiplier, home court, and carry-over."""
+    games = (
+        game_fact.filter(pl.col("team_id") == pl.col("team_low"))
+        .sort(["sex", "season", "day_num", "game_key"])
+        .select("sex", "season", "day_num", "game_key", "team_low", "team_high",
+                "team_score", "opp_score", "win", "team_loc")
+    )
+    rows: list[dict[str, Any]] = []
+    elo: dict[tuple[str, int, int], float] = {}
+    prev_season_elo: dict[tuple[str, int], float] = {}
+
+    for r in games.iter_rows(named=True):
+        sex, season = r["sex"], r["season"]
+        t_low, t_high = r["team_low"], r["team_high"]
+
+        # Season carry-over: start from 1500 + carry_over * (prev - 1500)
+        default_low = 1500.0 + carry_over * (prev_season_elo.get((sex, t_low), 1500.0) - 1500.0)
+        default_high = 1500.0 + carry_over * (prev_season_elo.get((sex, t_high), 1500.0) - 1500.0)
+
+        elo_low = elo.get((sex, season, t_low), default_low)
+        elo_high = elo.get((sex, season, t_high), default_high)
+
+        # Home court adjustment for expected win probability
+        loc = r["team_loc"] if r["team_loc"] else "N"
+        if loc == "H":
+            elo_adj_low = elo_low + home_advantage
+            elo_adj_high = elo_high
+        elif loc == "A":
+            elo_adj_low = elo_low
+            elo_adj_high = elo_high + home_advantage
+        else:
+            elo_adj_low = elo_low
+            elo_adj_high = elo_high
+
+        expected_low = 1.0 / (1.0 + 10.0 ** (-(elo_adj_low - elo_adj_high) / 400.0))
+        expected_margin = 25.0 * (expected_low * 2.0 - 1.0)
+
+        actual_margin_low = float(r["team_score"] - r["opp_score"])
+        actual_win_low = int(r["win"])
+
+        # Margin-of-victory multiplier (FiveThirtyEight-style)
+        elo_diff = abs(elo_low - elo_high)
+        mov_mult = np.log(abs(actual_margin_low) + 1.0) * (2.2 / (elo_diff * 0.001 + 2.2))
+
+        k_eff = k_factor * mov_mult
+
+        elo_low_new = elo_low + k_eff * (actual_win_low - expected_low)
+        elo_high_new = elo_high + k_eff * ((1 - actual_win_low) - (1 - expected_low))
+
+        elo[(sex, season, t_low)] = elo_low_new
+        elo[(sex, season, t_high)] = elo_high_new
+        prev_season_elo[(sex, t_low)] = elo_low_new
+        prev_season_elo[(sex, t_high)] = elo_high_new
+
+        rows.append({
+            "sex": sex, "season": season, "day_num": r["day_num"],
+            "game_key": r["game_key"], "team_id": t_low,
+            "elo_before": elo_low, "elo_after": elo_low_new,
+            "expected_win_prob": expected_low, "expected_margin": expected_margin,
+            "actual_win": actual_win_low, "actual_margin": actual_margin_low,
+        })
+        rows.append({
+            "sex": sex, "season": season, "day_num": r["day_num"],
+            "game_key": r["game_key"], "team_id": t_high,
+            "elo_before": elo_high, "elo_after": elo_high_new,
+            "expected_win_prob": 1.0 - expected_low, "expected_margin": -expected_margin,
+            "actual_win": 1 - actual_win_low, "actual_margin": -actual_margin_low,
+        })
+
+    if not rows:
+        return pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
+            "game_key": pl.Utf8, "team_id": pl.Int64,
+            "elo_before": pl.Float64, "elo_after": pl.Float64,
+            "expected_win_prob": pl.Float64, "expected_margin": pl.Float64,
+            "actual_win": pl.Int64, "actual_margin": pl.Float64,
+        })
+    return pl.DataFrame(rows).sort(["sex", "season", "day_num", "game_key", "team_id"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – Heat Score Engine
+# ---------------------------------------------------------------------------
+
+def _compute_heat_scores(elo_ratings: pl.DataFrame) -> pl.DataFrame:
+    """Rolling over-performance relative to ELO expectations."""
+    if elo_ratings.height == 0:
+        return pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
+            "team_id": pl.Int64, "heat_delta": pl.Float64,
+            "heat_1g": pl.Float64, "heat_3g": pl.Float64, "heat_5g": pl.Float64,
+        })
+
+    base = (
+        elo_ratings.with_columns(
+            (pl.col("actual_margin").cast(pl.Float64) - pl.col("expected_margin")).alias("heat_delta")
+        )
+        .sort(["sex", "season", "team_id", "day_num"])
+    )
+
+    lagged = base
+    for i in range(1, 6):
+        lagged = lagged.with_columns(
+            pl.col("heat_delta").shift(i).over(["sex", "season", "team_id"]).alias(f"_lag{i}")
+        )
+
+    return lagged.with_columns(
+        pl.col("_lag1").alias("heat_1g"),
+        pl.mean_horizontal("_lag1", "_lag2", "_lag3").alias("heat_3g"),
+        pl.mean_horizontal("_lag1", "_lag2", "_lag3", "_lag4", "_lag5").alias("heat_5g"),
+    ).select("sex", "season", "day_num", "team_id", "heat_delta", "heat_1g", "heat_3g", "heat_5g")
+
+
+def _get_pre_tournament_heat(heat_scores: pl.DataFrame, tourney_cutoff_day: int = 132) -> pl.DataFrame:
+    """Last heat row per team per season before the tournament."""
+    return (
+        heat_scores.filter(pl.col("day_num") <= tourney_cutoff_day)
+        .sort(["sex", "season", "team_id", "day_num"])
+        .group_by(["sex", "season", "team_id"])
+        .last()
+    )
+
+
+def _load_seed_map(ingest_manifest: dict[str, Any]) -> pl.DataFrame:
+    """Load tournament seeds for M and W, extracting numeric seed."""
+    files = ingest_manifest["kaggle"]["files"]
+    frames: list[pl.DataFrame] = []
+    for key, sex in [("MNCAATourneySeeds", "M"), ("WNCAATourneySeeds", "W")]:
+        if key not in files:
+            continue
+        df = _read_parquet(Path(files[key]["artifact"]))
+        if "Seed" not in df.columns or "TeamID" not in df.columns:
+            continue
+        df = df.select(
+            pl.lit(sex).alias("sex"),
+            pl.col("Season").cast(pl.Int64).alias("season"),
+            pl.col("TeamID").cast(pl.Int64).alias("team_id"),
+            pl.col("Seed").str.extract(r"(\d+)", 1).cast(pl.Int64).alias("seed_num"),
+        )
+        frames.append(df)
+    if not frames:
+        return pl.DataFrame(schema={"sex": pl.Utf8, "season": pl.Int64, "team_id": pl.Int64, "seed_num": pl.Int64})
+    return pl.concat(frames, how="vertical")
+
+
+def run_elo_and_heat(config: PipelineConfig) -> dict[str, Any]:
+    """Compute ELO ratings and heat scores from silver game_fact."""
+    game_fact = _read_parquet(config.silver_dir / "game_fact.parquet")
+
+    elo_ratings = _compute_elo_ratings(game_fact)
+    heat_scores = _compute_heat_scores(elo_ratings)
+
+    _write_parquet(elo_ratings, config.silver_dir / "elo_ratings.parquet")
+    _write_parquet(heat_scores, config.silver_dir / "heat_scores.parquet")
+    _write_parquet(elo_ratings, config.gold_dir / "elo_ratings.parquet")
+    _write_parquet(heat_scores, config.gold_dir / "heat_scores.parquet")
+
+    return {"elo_rows": elo_ratings.height, "heat_rows": heat_scores.height}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 – Monte Carlo Bracket Simulation helpers
+# ---------------------------------------------------------------------------
+
+def _build_prob_lookup(submission: pl.DataFrame) -> dict[tuple[int, int], float]:
+    """Build {(team_low, team_high): pred_low_wins} lookup."""
+    lookup: dict[tuple[int, int], float] = {}
+    for row in submission.iter_rows(named=True):
+        parts = row["ID"].split("_")
+        lookup[(int(parts[1]), int(parts[2]))] = float(row["Pred"])
+    return lookup
+
+
+def _simulate_bracket(
+    seeds_df: pl.DataFrame,
+    slots_df: pl.DataFrame,
+    prob_lookup: dict[tuple[int, int], float],
+    n_sims: int = 100_000,
+) -> dict[tuple[int, int], float]:
+    """Vectorised Monte Carlo bracket simulation.  Returns {(t_low, t_high): frac_low_wins}."""
+    if seeds_df.height == 0 or slots_df.height == 0:
+        return {}
+
+    seed_to_team: dict[str, int] = {}
+    for row in seeds_df.iter_rows(named=True):
+        seed_to_team[row["Seed"]] = int(row["TeamID"])
+    if not seed_to_team:
+        return {}
+
+    slots = sorted(
+        [{"slot": r["Slot"], "strong": r["StrongSeed"], "weak": r["WeakSeed"]}
+         for r in slots_df.iter_rows(named=True)],
+        key=lambda s: s["slot"],
+    )
+
+    all_keys: set[str] = set(seed_to_team.keys())
+    for s in slots:
+        all_keys.update([s["slot"], s["strong"], s["weak"]])
+    key_to_idx = {k: i for i, k in enumerate(sorted(all_keys))}
+
+    team_at = np.zeros((n_sims, len(key_to_idx)), dtype=np.int32)
+    for seed, tid in seed_to_team.items():
+        team_at[:, key_to_idx[seed]] = tid
+
+    rng = np.random.default_rng(42)
+    draws = rng.random((n_sims, len(slots)))
+
+    win_counts: dict[tuple[int, int], int] = {}
+    game_counts: dict[tuple[int, int], int] = {}
+
+    for game_idx, slot_info in enumerate(slots):
+        si = key_to_idx[slot_info["strong"]]
+        wi = key_to_idx[slot_info["weak"]]
+        oi = key_to_idx[slot_info["slot"]]
+
+        ta = team_at[:, si]
+        tb = team_at[:, wi]
+        t_low = np.minimum(ta, tb)
+        t_high = np.maximum(ta, tb)
+
+        unique_matchups = np.unique(np.column_stack([t_low, t_high]), axis=0)
+
+        for matchup in unique_matchups:
+            ml, mh = int(matchup[0]), int(matchup[1])
+            if ml == 0 or mh == 0:
+                continue
+            pair = (ml, mh)
+            prob_low = prob_lookup.get(pair, 0.5)
+            mask = (t_low == ml) & (t_high == mh)
+            count = int(mask.sum())
+            game_counts[pair] = game_counts.get(pair, 0) + count
+
+            low_wins = draws[:, game_idx] < prob_low
+            win_counts[pair] = win_counts.get(pair, 0) + int((low_wins & mask).sum())
+
+            team_at[:, oi] = np.where(
+                mask, np.where(low_wins, t_low, t_high), team_at[:, oi]
+            )
+
+    return {pair: win_counts.get(pair, 0) / cnt for pair, cnt in game_counts.items() if cnt > 0}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 – Enhanced team-season feature builder
+# ---------------------------------------------------------------------------
+
+def _build_team_season_features(
+    team_games: pl.DataFrame,
+    elo_ratings: pl.DataFrame | None = None,
+    heat_scores: pl.DataFrame | None = None,
+) -> pl.DataFrame:
     ordered = team_games.sort(["sex", "season", "team_id", "day_num"])
-    return ordered.group_by(["sex", "season", "team_id"]).agg(
+
+    has_detail = "fgm" in ordered.columns
+
+    base_aggs = [
         pl.len().alias("games_played"),
         pl.sum("win").alias("wins"),
         (pl.len() - pl.sum("win")).alias("losses"),
@@ -987,7 +1324,130 @@ def _build_team_season_features(team_games: pl.DataFrame) -> pl.DataFrame:
         pl.col("opp_score").tail(5).mean().alias("last5_avg_pts_against"),
         (pl.col("team_score") - pl.col("opp_score")).tail(5).mean().alias("last5_avg_margin"),
         pl.col("win").tail(5).mean().alias("last5_win_rate"),
+    ]
+
+    if has_detail:
+        detail_aggs = [
+            # Shooting efficiency
+            (pl.sum("fgm") / pl.sum("fga")).alias("fg_pct"),
+            (pl.sum("fgm3") / pl.sum("fga3")).alias("fg3_pct"),
+            (pl.sum("ftm") / pl.sum("fta")).alias("ft_pct"),
+            # Opponent shooting
+            (pl.sum("opp_fgm") / pl.sum("opp_fga")).alias("opp_fg_pct"),
+            # Rebounding
+            ((pl.sum("oreb") + pl.sum("dreb")) - (pl.sum("opp_oreb") + pl.sum("opp_dreb"))).cast(pl.Float64).alias("total_reb_margin"),
+            pl.mean("oreb").alias("avg_oreb"),
+            pl.mean("dreb").alias("avg_dreb"),
+            # Ball handling
+            pl.mean("ast").alias("avg_ast"),
+            pl.mean("tov").alias("avg_tov"),
+            pl.mean("stl").alias("avg_stl"),
+            pl.mean("blk").alias("avg_blk"),
+            # Opponent turnovers (defensive forcing)
+            pl.mean("opp_tov").alias("avg_opp_tov"),
+            # Tempo proxy: possessions ~ FGA - OREB + TO + 0.475 * FTA
+            (pl.col("fga") - pl.col("oreb") + pl.col("tov") + pl.col("fta") * 0.475).mean().alias("avg_possessions"),
+            # Last-5 detail
+            pl.col("fgm").tail(5).sum() / pl.col("fga").tail(5).sum(),  # computed below
+        ]
+        base_aggs.extend(detail_aggs)
+
+    features = ordered.group_by(["sex", "season", "team_id"]).agg(
+        base_aggs
     ).with_columns((pl.col("wins") / pl.col("games_played")).alias("win_rate"))
+
+    if has_detail:
+        # Compute derived features
+        features = features.with_columns(
+            ((pl.col("total_reb_margin")) / pl.col("games_played")).alias("avg_reb_margin"),
+            (pl.col("avg_ast") / pl.col("avg_tov").clip(0.1, None)).alias("ast_to_ratio"),
+            (pl.col("avg_stl") + pl.col("avg_blk")).alias("avg_stl_blk"),
+        ).drop("total_reb_margin", "literal")
+    else:
+        features = features.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("fg_pct"),
+            pl.lit(None, dtype=pl.Float64).alias("fg3_pct"),
+            pl.lit(None, dtype=pl.Float64).alias("ft_pct"),
+            pl.lit(None, dtype=pl.Float64).alias("opp_fg_pct"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_oreb"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_dreb"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_ast"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_tov"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_stl"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_blk"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_opp_tov"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_possessions"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_reb_margin"),
+            pl.lit(None, dtype=pl.Float64).alias("ast_to_ratio"),
+            pl.lit(None, dtype=pl.Float64).alias("avg_stl_blk"),
+        )
+
+    # Join season-end ELO (last elo_after before day 133)
+    if elo_ratings is not None and elo_ratings.height > 0:
+        season_end_elo = (
+            elo_ratings.filter(pl.col("day_num") <= 132)
+            .sort(["sex", "season", "team_id", "day_num"])
+            .group_by(["sex", "season", "team_id"])
+            .agg(pl.col("elo_after").last().alias("season_end_elo"))
+        )
+        features = features.join(season_end_elo, on=["sex", "season", "team_id"], how="left")
+
+        # Strength of Schedule: average opponent ELO
+        opp_elo = (
+            elo_ratings.filter(pl.col("day_num") <= 132)
+            .sort(["sex", "season", "team_id", "day_num"])
+            .group_by(["sex", "season", "team_id"])
+            .agg(pl.col("elo_after").last().alias("opp_elo"))
+        )
+        # Join opponent ELO via game_fact to compute SOS
+        if team_games.height > 0:
+            sos = (
+                team_games.filter(pl.col("day_num") <= 132)
+                .select("sex", "season", "team_id", "opp_team_id")
+                .join(
+                    opp_elo.rename({"team_id": "opp_team_id"}),
+                    on=["sex", "season", "opp_team_id"],
+                    how="left",
+                )
+                .group_by(["sex", "season", "team_id"])
+                .agg(pl.mean("opp_elo").alias("sos"))
+            )
+            features = features.join(sos, on=["sex", "season", "team_id"], how="left")
+        else:
+            features = features.with_columns(pl.lit(None, dtype=pl.Float64).alias("sos"))
+    else:
+        features = features.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("season_end_elo"),
+            pl.lit(None, dtype=pl.Float64).alias("sos"),
+        )
+
+    # Join pre-tournament heat scores
+    if heat_scores is not None and heat_scores.height > 0:
+        pre_heat = _get_pre_tournament_heat(heat_scores)
+        features = features.join(
+            pre_heat.select("sex", "season", "team_id", "heat_1g", "heat_3g", "heat_5g").rename({
+                "heat_1g": "pre_tourney_heat_1g",
+                "heat_3g": "pre_tourney_heat_3g",
+                "heat_5g": "pre_tourney_heat_5g",
+            }),
+            on=["sex", "season", "team_id"],
+            how="left",
+        )
+        # Enhanced heat: heat_trend (heating up/cooling off), abs_heat
+        features = features.with_columns(
+            (pl.col("pre_tourney_heat_5g") - pl.col("pre_tourney_heat_1g")).alias("heat_trend"),
+            pl.col("pre_tourney_heat_5g").abs().alias("abs_heat_5g"),
+        )
+    else:
+        features = features.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_1g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_3g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_5g"),
+            pl.lit(None, dtype=pl.Float64).alias("heat_trend"),
+            pl.lit(None, dtype=pl.Float64).alias("abs_heat_5g"),
+        )
+
+    return features
 
 
 def _line_features_for_pairs(sample: pl.DataFrame, cbbd_line_consensus: pl.DataFrame, season: int) -> pl.DataFrame:
@@ -1023,7 +1483,115 @@ def _line_features_for_pairs(sample: pl.DataFrame, cbbd_line_consensus: pl.DataF
     )
 
 
-def _pair_features_from_ids(ids: pl.DataFrame, team_features: pl.DataFrame, cbbd_line_consensus: pl.DataFrame) -> pl.DataFrame:
+def _team_feature_rename_map(columns: list[str]) -> dict[str, str]:
+    """Build rename mapping for team_features → low/high suffixed columns."""
+    skip = {"sex", "season"}
+    mapping: dict[str, str] = {}
+    for col in columns:
+        if col in skip:
+            continue
+        if col == "team_id":
+            mapping["team_id"] = "team_low"  # will be overridden for high
+        else:
+            mapping[col] = f"{col}_low"
+    # Build both low and high
+    low_map = dict(mapping)
+    high_map = {}
+    for col in columns:
+        if col in skip:
+            continue
+        if col == "team_id":
+            high_map["team_id"] = "team_high"
+        else:
+            high_map[col] = f"{col}_high"
+    # Return combined (caller splits by suffix)
+    combined = {}
+    for col in columns:
+        if col in skip:
+            continue
+        if col == "team_id":
+            combined[col] = f"{col}__BOTH"  # placeholder
+        else:
+            combined[col] = f"{col}_low"  # default to low
+    return combined
+
+
+def _build_side_rename(columns: list[str], side: str) -> dict[str, str]:
+    """Rename team features columns to _low or _high suffix."""
+    skip = {"sex", "season"}
+    mapping: dict[str, str] = {}
+    for col in columns:
+        if col in skip:
+            continue
+        if col == "team_id":
+            mapping[col] = f"team_{side}"
+        else:
+            mapping[col] = f"{col}_{side}"
+    return mapping
+
+
+def _compute_diff_features(paired: pl.DataFrame) -> pl.DataFrame:
+    """Compute all pairwise difference features from paired team data."""
+    diffs = [
+        (pl.col("win_rate_low") - pl.col("win_rate_high")).alias("diff_win_rate"),
+        (pl.col("avg_margin_low") - pl.col("avg_margin_high")).alias("diff_avg_margin"),
+        (pl.col("avg_pts_for_low") - pl.col("avg_pts_for_high")).alias("diff_avg_pts_for"),
+        (pl.col("avg_pts_against_high") - pl.col("avg_pts_against_low")).alias("diff_defense_proxy"),
+        (pl.col("last5_win_rate_low") - pl.col("last5_win_rate_high")).alias("diff_last5_win_rate"),
+        (pl.col("last5_avg_margin_low") - pl.col("last5_avg_margin_high")).alias("diff_last5_avg_margin"),
+        (pl.col("season_end_elo_low").fill_null(1500.0) - pl.col("season_end_elo_high").fill_null(1500.0)).alias("diff_elo"),
+        (pl.col("pre_tourney_heat_1g_low").fill_null(0.0) - pl.col("pre_tourney_heat_1g_high").fill_null(0.0)).alias("diff_heat_1g"),
+        (pl.col("pre_tourney_heat_3g_low").fill_null(0.0) - pl.col("pre_tourney_heat_3g_high").fill_null(0.0)).alias("diff_heat_3g"),
+        (pl.col("pre_tourney_heat_5g_low").fill_null(0.0) - pl.col("pre_tourney_heat_5g_high").fill_null(0.0)).alias("diff_heat_5g"),
+        (pl.col("seed_low").fill_null(8).cast(pl.Float64) - pl.col("seed_high").fill_null(8).cast(pl.Float64)).alias("diff_seed"),
+    ]
+
+    # Enhanced heat features
+    if "heat_trend_low" in paired.columns:
+        diffs.append(
+            (pl.col("heat_trend_low").fill_null(0.0) - pl.col("heat_trend_high").fill_null(0.0)).alias("diff_heat_trend")
+        )
+        diffs.append(
+            (pl.col("abs_heat_5g_low").fill_null(0.0) - pl.col("abs_heat_5g_high").fill_null(0.0)).alias("diff_abs_heat_5g")
+        )
+
+    # SOS
+    if "sos_low" in paired.columns:
+        diffs.append(
+            (pl.col("sos_low").fill_null(1500.0) - pl.col("sos_high").fill_null(1500.0)).alias("diff_sos")
+        )
+
+    # Box score features
+    if "fg_pct_low" in paired.columns:
+        diffs.extend([
+            (pl.col("fg_pct_low").fill_null(0.45) - pl.col("fg_pct_high").fill_null(0.45)).alias("diff_fg_pct"),
+            (pl.col("fg3_pct_low").fill_null(0.33) - pl.col("fg3_pct_high").fill_null(0.33)).alias("diff_fg3_pct"),
+            (pl.col("ft_pct_low").fill_null(0.70) - pl.col("ft_pct_high").fill_null(0.70)).alias("diff_ft_pct"),
+            (pl.col("opp_fg_pct_low").fill_null(0.45) - pl.col("opp_fg_pct_high").fill_null(0.45)).alias("diff_opp_fg_pct"),
+            (pl.col("avg_reb_margin_low").fill_null(0.0) - pl.col("avg_reb_margin_high").fill_null(0.0)).alias("diff_reb_margin"),
+            (pl.col("ast_to_ratio_low").fill_null(1.0) - pl.col("ast_to_ratio_high").fill_null(1.0)).alias("diff_ast_to_ratio"),
+            (pl.col("avg_stl_blk_low").fill_null(0.0) - pl.col("avg_stl_blk_high").fill_null(0.0)).alias("diff_stl_blk"),
+            (pl.col("avg_possessions_low").fill_null(65.0) - pl.col("avg_possessions_high").fill_null(65.0)).alias("diff_possessions"),
+        ])
+
+    # Seed interaction features
+    diffs.append(
+        (pl.col("seed_low").fill_null(8).cast(pl.Float64) * pl.col("seed_high").fill_null(8).cast(pl.Float64)).alias("seed_product")
+    )
+
+    # Consensus spread (fill with 0 when missing)
+    if "consensus_low_spread" in paired.columns:
+        diffs.append(pl.col("consensus_low_spread").fill_null(0.0).alias("consensus_low_spread_filled"))
+
+    return paired.with_columns(diffs)
+
+
+def _pair_features_from_ids(
+    ids: pl.DataFrame,
+    team_features: pl.DataFrame,
+    cbbd_line_consensus: pl.DataFrame,
+    seed_map: pl.DataFrame | None = None,
+) -> pl.DataFrame:
     parsed = ids.with_columns(
         pl.col("ID").str.split("_").list.get(0).cast(pl.Int64).alias("season"),
         pl.col("ID").str.split("_").list.get(1).cast(pl.Int64).alias("team_low"),
@@ -1032,40 +1600,9 @@ def _pair_features_from_ids(ids: pl.DataFrame, team_features: pl.DataFrame, cbbd
         pl.col("team_low").map_elements(_infer_sex_from_team_id, return_dtype=pl.Utf8).alias("sex")
     )
 
-    low_features = team_features.rename(
-        {
-            "team_id": "team_low",
-            "games_played": "games_low",
-            "wins": "wins_low",
-            "losses": "losses_low",
-            "avg_pts_for": "avg_pts_for_low",
-            "avg_pts_against": "avg_pts_against_low",
-            "avg_margin": "avg_margin_low",
-            "avg_num_ot": "avg_num_ot_low",
-            "win_rate": "win_rate_low",
-            "last5_avg_pts_for": "last5_avg_pts_for_low",
-            "last5_avg_pts_against": "last5_avg_pts_against_low",
-            "last5_avg_margin": "last5_avg_margin_low",
-            "last5_win_rate": "last5_win_rate_low",
-        }
-    )
-    high_features = team_features.rename(
-        {
-            "team_id": "team_high",
-            "games_played": "games_high",
-            "wins": "wins_high",
-            "losses": "losses_high",
-            "avg_pts_for": "avg_pts_for_high",
-            "avg_pts_against": "avg_pts_against_high",
-            "avg_margin": "avg_margin_high",
-            "avg_num_ot": "avg_num_ot_high",
-            "win_rate": "win_rate_high",
-            "last5_avg_pts_for": "last5_avg_pts_for_high",
-            "last5_avg_pts_against": "last5_avg_pts_against_high",
-            "last5_avg_margin": "last5_avg_margin_high",
-            "last5_win_rate": "last5_win_rate_high",
-        }
-    )
+    rename_map = _team_feature_rename_map(team_features.columns)
+    low_features = team_features.rename(_build_side_rename(team_features.columns, "low"))
+    high_features = team_features.rename(_build_side_rename(team_features.columns, "high"))
 
     paired = parsed.join(low_features, on=["sex", "season", "team_low"], how="left").join(
         high_features, on=["sex", "season", "team_high"], how="left"
@@ -1078,17 +1615,27 @@ def _pair_features_from_ids(ids: pl.DataFrame, team_features: pl.DataFrame, cbbd
         how="left",
     )
 
-    return paired.with_columns(
-        (pl.col("win_rate_low") - pl.col("win_rate_high")).alias("diff_win_rate"),
-        (pl.col("avg_margin_low") - pl.col("avg_margin_high")).alias("diff_avg_margin"),
-        (pl.col("avg_pts_for_low") - pl.col("avg_pts_for_high")).alias("diff_avg_pts_for"),
-        (pl.col("avg_pts_against_high") - pl.col("avg_pts_against_low")).alias("diff_defense_proxy"),
-        (pl.col("last5_win_rate_low") - pl.col("last5_win_rate_high")).alias("diff_last5_win_rate"),
-        (pl.col("last5_avg_margin_low") - pl.col("last5_avg_margin_high")).alias("diff_last5_avg_margin"),
-    )
+    # Join seed features
+    if seed_map is not None and seed_map.height > 0:
+        seed_low = seed_map.rename({"team_id": "team_low", "seed_num": "seed_low"}).select("sex", "season", "team_low", "seed_low")
+        seed_high = seed_map.rename({"team_id": "team_high", "seed_num": "seed_high"}).select("sex", "season", "team_high", "seed_high")
+        paired = paired.join(seed_low, on=["sex", "season", "team_low"], how="left")
+        paired = paired.join(seed_high, on=["sex", "season", "team_high"], how="left")
+    else:
+        paired = paired.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("seed_low"),
+            pl.lit(None, dtype=pl.Int64).alias("seed_high"),
+        )
+
+    return _compute_diff_features(paired)
 
 
-def _build_training_pairs(ingest_manifest: dict[str, Any], team_features: pl.DataFrame, target_season: int) -> pl.DataFrame:
+def _build_training_pairs(
+    ingest_manifest: dict[str, Any],
+    team_features: pl.DataFrame,
+    target_season: int,
+    seed_map: pl.DataFrame | None = None,
+) -> pl.DataFrame:
     files = ingest_manifest["kaggle"]["files"]
     m_tourney = _read_parquet(Path(files["MNCAATourneyCompactResults"]["artifact"]))
     w_tourney = _read_parquet(Path(files["WNCAATourneyCompactResults"]["artifact"]))
@@ -1105,57 +1652,41 @@ def _build_training_pairs(ingest_manifest: dict[str, Any], team_features: pl.Dat
     labels = pl.concat([_normalize_tourney(m_tourney, "M"), _normalize_tourney(w_tourney, "W")], how="vertical")
     labels = labels.filter(pl.col("season") < target_season)
 
-    low_features = team_features.rename(
-        {
-            "team_id": "team_low",
-            "games_played": "games_low",
-            "wins": "wins_low",
-            "losses": "losses_low",
-            "avg_pts_for": "avg_pts_for_low",
-            "avg_pts_against": "avg_pts_against_low",
-            "avg_margin": "avg_margin_low",
-            "avg_num_ot": "avg_num_ot_low",
-            "win_rate": "win_rate_low",
-            "last5_avg_pts_for": "last5_avg_pts_for_low",
-            "last5_avg_pts_against": "last5_avg_pts_against_low",
-            "last5_avg_margin": "last5_avg_margin_low",
-            "last5_win_rate": "last5_win_rate_low",
-        }
-    )
-    high_features = team_features.rename(
-        {
-            "team_id": "team_high",
-            "games_played": "games_high",
-            "wins": "wins_high",
-            "losses": "losses_high",
-            "avg_pts_for": "avg_pts_for_high",
-            "avg_pts_against": "avg_pts_against_high",
-            "avg_margin": "avg_margin_high",
-            "avg_num_ot": "avg_num_ot_high",
-            "win_rate": "win_rate_high",
-            "last5_avg_pts_for": "last5_avg_pts_for_high",
-            "last5_avg_pts_against": "last5_avg_pts_against_high",
-            "last5_avg_margin": "last5_avg_margin_high",
-            "last5_win_rate": "last5_win_rate_high",
-        }
-    )
+    low_features = team_features.rename(_build_side_rename(team_features.columns, "low"))
+    high_features = team_features.rename(_build_side_rename(team_features.columns, "high"))
 
-    return labels.join(low_features, on=["sex", "season", "team_low"], how="left").join(
+    paired = labels.join(low_features, on=["sex", "season", "team_low"], how="left").join(
         high_features, on=["sex", "season", "team_high"], how="left"
-    ).with_columns(
-        (pl.col("win_rate_low") - pl.col("win_rate_high")).alias("diff_win_rate"),
-        (pl.col("avg_margin_low") - pl.col("avg_margin_high")).alias("diff_avg_margin"),
-        (pl.col("avg_pts_for_low") - pl.col("avg_pts_for_high")).alias("diff_avg_pts_for"),
-        (pl.col("avg_pts_against_high") - pl.col("avg_pts_against_low")).alias("diff_defense_proxy"),
-        (pl.col("last5_win_rate_low") - pl.col("last5_win_rate_high")).alias("diff_last5_win_rate"),
-        (pl.col("last5_avg_margin_low") - pl.col("last5_avg_margin_high")).alias("diff_last5_avg_margin"),
     )
 
+    # Join seed features
+    if seed_map is not None and seed_map.height > 0:
+        seed_low = seed_map.rename({"team_id": "team_low", "seed_num": "seed_low"}).select("sex", "season", "team_low", "seed_low")
+        seed_high = seed_map.rename({"team_id": "team_high", "seed_num": "seed_high"}).select("sex", "season", "team_high", "seed_high")
+        paired = paired.join(seed_low, on=["sex", "season", "team_low"], how="left")
+        paired = paired.join(seed_high, on=["sex", "season", "team_high"], how="left")
+    else:
+        paired = paired.with_columns(
+            pl.lit(None, dtype=pl.Int64).alias("seed_low"),
+            pl.lit(None, dtype=pl.Int64).alias("seed_high"),
+        )
 
-def _train_model(train_df: pl.DataFrame, feature_cols: list[str]) -> Any:
-    if train_df.height == 0 or LogisticRegression is None:
+    # Add consensus_low_spread placeholder filled with 0 (not available for training)
+    paired = paired.with_columns(pl.lit(0.0, dtype=pl.Float64).alias("consensus_low_spread"))
+
+    return _compute_diff_features(paired)
+
+
+def _train_model(train_df: pl.DataFrame, feature_cols: list[str], n_estimators: int = 500,
+                 max_depth: int = 5, learning_rate: float = 0.04,
+                 subsample: float = 0.8, colsample_bytree: float = 0.7,
+                 min_child_weight: int = 3, gamma: float = 0.1,
+                 reg_alpha: float = 0.1, reg_lambda: float = 2.0) -> Any:
+    if train_df.height == 0:
         return None
-    cleaned = train_df.select(feature_cols + ["target_low_wins"]).drop_nulls()
+    cleaned = train_df.select(
+        [pl.col(c).fill_null(0.0) for c in feature_cols] + [pl.col("target_low_wins")]
+    ).drop_nulls()
     if cleaned.height == 0:
         return None
     y_values = cleaned.select("target_low_wins").to_series().to_list()
@@ -1163,40 +1694,149 @@ def _train_model(train_df: pl.DataFrame, feature_cols: list[str]) -> Any:
         return None
     x_values = cleaned.select(feature_cols).to_numpy()
 
-    model = LogisticRegression(max_iter=1000)
-    model.fit(x_values, y_values)
-    return model
+    if XGBClassifier is not None:
+        model = XGBClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight,
+            gamma=gamma,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
+            eval_metric="logloss",
+            verbosity=0,
+        )
+        model.fit(x_values, y_values)
+        return model
+
+    if LogisticRegression is not None:
+        model = LogisticRegression(max_iter=1000)
+        model.fit(x_values, y_values)
+        return model
+
+    return None
 
 
-def _predict_with_model(model: Any, features_df: pl.DataFrame, feature_cols: list[str]) -> pl.Series:
+def _time_series_cv_brier(training: pl.DataFrame, feature_cols: list[str],
+                          sex: str = "M", cv_start: int = 2019,
+                          cv_end: int = 2025, **model_kwargs: Any) -> tuple[float, list[float]]:
+    """Time-series cross-validation returning average Brier and per-fold Brier scores."""
+    fold_briers: list[float] = []
+    sex_data = training.filter(pl.col("sex") == sex)
+
+    for holdout_year in range(cv_start, cv_end + 1):
+        train_fold = sex_data.filter(pl.col("season") < holdout_year)
+        test_fold = sex_data.filter(pl.col("season") == holdout_year)
+        if train_fold.height < 50 or test_fold.height == 0:
+            continue
+
+        model = _train_model(train_fold, feature_cols, **model_kwargs)
+        if model is None:
+            continue
+
+        preds = _predict_with_model_raw(model, test_fold, feature_cols)
+        actuals = test_fold.select("target_low_wins").to_series().to_numpy().astype(np.float64)
+        brier = float(np.mean((preds - actuals) ** 2))
+        fold_briers.append(brier)
+
+    avg_brier = float(np.mean(fold_briers)) if fold_briers else 1.0
+    return avg_brier, fold_briers
+
+
+def _predict_with_model_raw(model: Any, features_df: pl.DataFrame, feature_cols: list[str]) -> np.ndarray:
+    """Get raw model probabilities without clipping."""
+    if features_df.height == 0:
+        return np.array([], dtype=np.float64)
+    if model is None:
+        return np.full(features_df.height, 0.5, dtype=np.float64)
+    filled = features_df.select([pl.col(c).fill_null(0.0) for c in feature_cols])
+    return model.predict_proba(filled.to_numpy())[:, 1].astype(np.float64)
+
+
+def _fit_calibration(model: Any, training: pl.DataFrame, feature_cols: list[str],
+                     sex: str = "M", cv_start: int = 2019, cv_end: int = 2025) -> Any:
+    """Fit isotonic calibration on out-of-fold predictions from time-series CV."""
+    if IsotonicRegression is None:
+        return None
+
+    all_preds: list[float] = []
+    all_actuals: list[float] = []
+    sex_data = training.filter(pl.col("sex") == sex)
+
+    for holdout_year in range(cv_start, cv_end + 1):
+        train_fold = sex_data.filter(pl.col("season") < holdout_year)
+        test_fold = sex_data.filter(pl.col("season") == holdout_year)
+        if train_fold.height < 50 or test_fold.height == 0:
+            continue
+
+        fold_model = _train_model(train_fold, feature_cols)
+        if fold_model is None:
+            continue
+
+        preds = _predict_with_model_raw(fold_model, test_fold, feature_cols)
+        actuals = test_fold.select("target_low_wins").to_series().to_numpy().astype(np.float64)
+        all_preds.extend(preds.tolist())
+        all_actuals.extend(actuals.tolist())
+
+    if len(all_preds) < 20:
+        return None
+
+    calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+    calibrator.fit(np.array(all_preds), np.array(all_actuals))
+    return calibrator
+
+
+def _dynamic_clip(preds: np.ndarray, paired_df: pl.DataFrame) -> np.ndarray:
+    """Apply seed-matchup-aware probability clipping.
+
+    Extreme seed matchups (1v16, 2v15) get wider bounds when model is confident.
+    """
+    clipped = preds.copy()
+    if "seed_low" not in paired_df.columns or "seed_high" not in paired_df.columns:
+        return np.clip(clipped, 0.025, 0.975)
+
+    seed_low = paired_df["seed_low"].fill_null(8).to_numpy()
+    seed_high = paired_df["seed_high"].fill_null(8).to_numpy()
+    seed_diff = np.abs(seed_low - seed_high)
+
+    # Default bounds
+    lo = np.full_like(clipped, 0.025)
+    hi = np.full_like(clipped, 0.975)
+
+    # Widen bounds for extreme seed matchups
+    mask_1v16 = seed_diff >= 15  # 1v16
+    mask_2v15 = (seed_diff >= 13) & (seed_diff < 15)  # 2v15
+    mask_3v14 = (seed_diff >= 11) & (seed_diff < 13)  # 3v14
+
+    lo[mask_1v16] = 0.005
+    hi[mask_1v16] = 0.995
+    lo[mask_2v15] = 0.01
+    hi[mask_2v15] = 0.99
+    lo[mask_3v14] = 0.015
+    hi[mask_3v14] = 0.985
+
+    return np.clip(clipped, lo, hi)
+
+
+def _predict_with_model(model: Any, features_df: pl.DataFrame, feature_cols: list[str],
+                        calibrator: Any = None) -> pl.Series:
     if features_df.height == 0:
         return pl.Series("pred", [], dtype=pl.Float64)
 
-    score_expr = (
-        0.5
-        + 0.35 * pl.col("diff_win_rate").fill_null(0.0)
-        + 0.03 * pl.col("diff_avg_margin").fill_null(0.0)
-        + 0.015 * pl.col("diff_last5_avg_margin").fill_null(0.0)
-        - 0.02 * pl.col("consensus_low_spread").fill_null(0.0)
-    )
-
     if model is None:
-        return features_df.select(score_expr.clip(0.025, 0.975).alias("pred"))["pred"]
+        return pl.Series("pred", [0.5] * features_df.height, dtype=pl.Float64)
 
-    selected = features_df.select(feature_cols)
-    row_ok_expr = pl.all_horizontal([pl.col(c).is_not_null() for c in feature_cols]).alias("row_ok")
-    marked = selected.with_columns(row_ok_expr)
-    preds = [0.5] * marked.height
+    preds = _predict_with_model_raw(model, features_df, feature_cols)
 
-    good = marked.filter(pl.col("row_ok")).drop("row_ok")
-    if good.height > 0:
-        good_idx = marked.with_row_index("idx").filter(pl.col("row_ok")).select("idx").to_series().to_list()
-        proba = model.predict_proba(good.to_numpy())[:, 1]
-        for idx, value in zip(good_idx, proba, strict=False):
-            preds[int(idx)] = float(value)
+    # Apply isotonic calibration if available
+    if calibrator is not None:
+        preds = calibrator.predict(preds)
 
-    clipped = [max(0.025, min(0.975, p)) for p in preds]
-    return pl.Series("pred", clipped, dtype=pl.Float64)
+    # Apply dynamic clipping based on seed matchups
+    clipped = _dynamic_clip(preds, features_df)
+    return pl.Series("pred", clipped.tolist(), dtype=pl.Float64)
 
 
 def _validation_split_metadata(config: PipelineConfig) -> dict[str, Any]:
@@ -1210,12 +1850,15 @@ def _validation_split_metadata(config: PipelineConfig) -> dict[str, Any]:
 
 def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> dict[str, Any]:
     game_fact = _read_parquet(config.silver_dir / "game_fact.parquet")
+    elo_ratings = _read_parquet(config.silver_dir / "elo_ratings.parquet")
+    heat_scores = _read_parquet(config.silver_dir / "heat_scores.parquet")
     cbbd_line_consensus = _read_parquet(config.silver_dir / "cbbd_line_consensus.parquet")
     sample = _read_parquet(Path(ingest_manifest["kaggle"]["files"]["SampleSubmissionStage2"]["artifact"]))
 
-    team_features = _build_team_season_features(game_fact)
-    pairwise_features = _pair_features_from_ids(sample.select("ID"), team_features, cbbd_line_consensus)
-    training = _build_training_pairs(ingest_manifest, team_features, config.target_season)
+    seed_map = _load_seed_map(ingest_manifest)
+    team_features = _build_team_season_features(game_fact, elo_ratings, heat_scores)
+    pairwise_features = _pair_features_from_ids(sample.select("ID"), team_features, cbbd_line_consensus, seed_map)
+    training = _build_training_pairs(ingest_manifest, team_features, config.target_season, seed_map)
 
     split_meta = _validation_split_metadata(config)
     feature_cols = [
@@ -1225,7 +1868,29 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         "diff_defense_proxy",
         "diff_last5_win_rate",
         "diff_last5_avg_margin",
+        "diff_elo",
+        "diff_heat_1g",
+        "diff_heat_3g",
+        "diff_heat_5g",
+        "diff_heat_trend",
+        "diff_abs_heat_5g",
+        "diff_seed",
+        "diff_sos",
+        "diff_fg_pct",
+        "diff_fg3_pct",
+        "diff_ft_pct",
+        "diff_opp_fg_pct",
+        "diff_reb_margin",
+        "diff_ast_to_ratio",
+        "diff_stl_blk",
+        "diff_possessions",
+        "seed_product",
+        "consensus_low_spread_filled",
     ]
+    # Keep only feature columns that actually exist in both training and prediction data
+    available_train_cols = set(training.columns) if training.height > 0 else set()
+    available_pred_cols = set(pairwise_features.columns) if pairwise_features.height > 0 else set()
+    feature_cols = [c for c in feature_cols if c in available_train_cols and c in available_pred_cols]
 
     predictions = []
     model_stats: dict[str, Any] = {}
@@ -1237,28 +1902,89 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         if sex == "M":
             train_fit = train_sex.filter(pl.col("season") <= split_meta["train_end_season"])
             holdout = train_sex.filter(pl.col("season") == split_meta["holdout_season"])
+            n_est = 500
         else:
             train_fit = train_sex
             holdout = pl.DataFrame(schema=train_sex.schema)
+            n_est = 400
 
-        model = _train_model(train_fit, feature_cols)
-        pred_values = _predict_with_model(model, pred_sex, feature_cols)
+        model = _train_model(train_fit, feature_cols, n_estimators=n_est)
+
+        # Fit isotonic calibration on time-series CV out-of-fold predictions
+        calibrator = _fit_calibration(model, training, feature_cols, sex=sex)
+
+        pred_values = _predict_with_model(model, pred_sex, feature_cols, calibrator=calibrator)
         pred_df = pred_sex.select("ID").with_columns(pred_values.alias("Pred"))
         predictions.append(pred_df)
+
+        # Holdout Brier score
+        holdout_brier = None
+        cv_brier = None
+        if holdout.height > 0 and model is not None:
+            holdout_preds = _predict_with_model(model, holdout, feature_cols, calibrator=calibrator)
+            actuals = holdout.select("target_low_wins").to_series().to_numpy().astype(np.float64)
+            holdout_brier = float(np.mean((holdout_preds.to_numpy() - actuals) ** 2))
+
+        # Time-series CV Brier
+        if sex == "M":
+            cv_brier_val, cv_folds = _time_series_cv_brier(training, feature_cols, sex=sex)
+            cv_brier = {"mean": cv_brier_val, "folds": cv_folds}
+
+        model_type = "flat_fallback"
+        if model is not None:
+            model_type = "xgboost" if XGBClassifier is not None and isinstance(model, XGBClassifier) else "logistic_regression"
 
         model_stats[sex] = {
             "train_rows": train_fit.height,
             "holdout_rows": holdout.height,
             "predict_rows": pred_sex.height,
-            "model_type": "logistic_regression" if model is not None else "heuristic_fallback",
+            "model_type": model_type,
             "good_train_rows": train_fit.select(feature_cols).drop_nulls().height,
+            "holdout_brier": holdout_brier,
+            "cv_brier": cv_brier,
+            "calibrated": calibrator is not None,
         }
 
     submission = pl.concat(predictions, how="vertical")
     submission = sample.select("ID").join(submission, on="ID", how="left").with_columns(
-        pl.col("Pred").fill_null(0.5).clip(0.025, 0.975)
+        pl.col("Pred").fill_null(0.5)
     )
 
+    # Monte Carlo bracket simulation
+    sim_meta: dict[str, Any] = {"simulated": False}
+    files = ingest_manifest["kaggle"]["files"]
+    prob_lookup = _build_prob_lookup(submission)
+
+    for sex, seeds_key, slots_key in [("M", "MNCAATourneySeeds", "MNCAATourneySlots"), ("W", "WNCAATourneySeeds", "WNCAATourneySlots")]:
+        if seeds_key not in files or slots_key not in files:
+            continue
+        all_seeds = _read_parquet(Path(files[seeds_key]["artifact"]))
+        all_slots = _read_parquet(Path(files[slots_key]["artifact"]))
+        target_seeds = all_seeds.filter(pl.col("Season") == config.target_season)
+        target_slots = all_slots.filter(pl.col("Season") == config.target_season)
+        if target_seeds.height == 0 or target_slots.height == 0:
+            continue
+
+        sim_preds = _simulate_bracket(target_seeds, target_slots, prob_lookup, n_sims=100_000)
+
+        if sim_preds:
+            sim_meta["simulated"] = True
+            sim_meta[f"{sex}_matchups_simulated"] = len(sim_preds)
+
+            blend_updates = [
+                {"ID": f"{config.target_season}_{t_low}_{t_high}", "sim_pred": sim_prob}
+                for (t_low, t_high), sim_prob in sim_preds.items()
+            ]
+            if blend_updates:
+                sim_df = pl.DataFrame(blend_updates)
+                submission = submission.join(sim_df, on="ID", how="left").with_columns(
+                    pl.when(pl.col("sim_pred").is_not_null())
+                    .then(pl.col("Pred") * 0.6 + pl.col("sim_pred") * 0.4)
+                    .otherwise(pl.col("Pred"))
+                    .alias("Pred")
+                ).drop("sim_pred")
+
+    # Write outputs
     game_features = game_fact.group_by(["sex", "season", "game_key"]).agg(
         pl.mean("team_score").alias("avg_team_points"),
         pl.mean("opp_score").alias("avg_opp_points"),
@@ -1278,8 +2004,15 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         "good_rows": int(quality.filter(pl.col("feature_row_quality_pass")).height),
         "bad_rows": int(quality.filter(~pl.col("feature_row_quality_pass")).height),
     }
+
+    perf_summary = {
+        "model_stats": model_stats,
+        "simulation": sim_meta,
+        "feature_cols": feature_cols,
+    }
     (config.reports_dir / "gold_quality_summary.json").write_text(json.dumps(quality_summary, indent=2, default=_json_default), encoding="utf-8")
     (config.reports_dir / "validation_split_summary.json").write_text(json.dumps(split_meta, indent=2, default=_json_default), encoding="utf-8")
+    (config.reports_dir / "model_performance_summary.json").write_text(json.dumps(perf_summary, indent=2, default=_json_default), encoding="utf-8")
 
     return {
         "team_season_rows": team_features.height,
@@ -1289,6 +2022,7 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         "model_stats": model_stats,
         "quality_summary": quality_summary,
         "validation_split": split_meta,
+        "simulation": sim_meta,
     }
 
 
@@ -1318,6 +2052,7 @@ def run_pipeline(project_root: Path, mode: str = "manual", target_season: int = 
     ingest_manifest = run_ingest(config)
     validation = run_validations(config, ingest_manifest)
     transform = run_transform(config, ingest_manifest)
+    elo_heat = run_elo_and_heat(config)
     gold = run_gold_and_model(config, ingest_manifest)
     finished_at = datetime.now(UTC).isoformat()
 
@@ -1334,6 +2069,60 @@ def run_pipeline(project_root: Path, mode: str = "manual", target_season: int = 
         "ingest": ingest_manifest,
         "validation": validation,
         "transform": transform,
+        "elo_heat": elo_heat,
+        "gold": gold,
+    }
+    _write_run_manifest(config, payload)
+    return payload
+
+
+def run_model_only(project_root: Path, target_season: int = 2026) -> dict[str, Any]:
+    """Reuse bronze/silver from artifacts/latest, recompute ELO + heat + gold/model."""
+    latest_dir = project_root / "artifacts" / "latest"
+    manifest_path = latest_dir / "run_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"No previous run found at {manifest_path}. Run full pipeline first.")
+
+    prev_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ingest_manifest = prev_manifest["ingest"]
+
+    config = PipelineConfig(project_root=project_root, mode="manual", target_season=target_season)
+    for path in [config.bronze_dir, config.silver_dir, config.gold_dir, config.reports_dir]:
+        path.mkdir(parents=True, exist_ok=True)
+
+    # Copy bronze and silver from latest run
+    prev_run_dir = Path(prev_manifest["artifacts"]["run_dir"])
+    for layer in ["bronze", "silver"]:
+        src = prev_run_dir / layer
+        dst = config.run_dir / layer
+        if src.exists():
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+
+    # Rewrite ingest artifact paths to point at this run's copies
+    for dataset_info in ingest_manifest.get("kaggle", {}).get("files", {}).values():
+        old_artifact = dataset_info.get("artifact", "")
+        if old_artifact:
+            dataset_info["artifact"] = old_artifact.replace(str(prev_run_dir), str(config.run_dir))
+
+    started_at = datetime.now(UTC).isoformat()
+    elo_heat = run_elo_and_heat(config)
+    gold = run_gold_and_model(config, ingest_manifest)
+    finished_at = datetime.now(UTC).isoformat()
+
+    payload = {
+        "run_id": config.run_id,
+        "mode": "model_only",
+        "target_season": target_season,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "artifacts": {
+            "run_dir": str(config.run_dir),
+            "submission": str(config.run_dir / "submission.csv"),
+        },
+        "ingest": ingest_manifest,
+        "elo_heat": elo_heat,
         "gold": gold,
     }
     _write_run_manifest(config, payload)
@@ -1345,10 +2134,15 @@ def cli_main() -> None:
     parser.add_argument("command", choices=["run"], nargs="?", default="run")
     parser.add_argument("--mode", choices=["manual", "daily"], default="manual")
     parser.add_argument("--target-season", type=int, default=2026)
+    parser.add_argument("--stage", choices=["full", "model"], default="full",
+                        help="'model' reuses existing bronze/silver from latest run")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[2]
-    result = run_pipeline(project_root=project_root, mode=args.mode, target_season=args.target_season)
+    if args.stage == "model":
+        result = run_model_only(project_root=project_root, target_season=args.target_season)
+    else:
+        result = run_pipeline(project_root=project_root, mode=args.mode, target_season=args.target_season)
     print(json.dumps({"run_id": result["run_id"], "submission": result["artifacts"]["submission"]}, indent=2))
 
 
