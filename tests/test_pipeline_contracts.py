@@ -15,6 +15,8 @@ if str(SRC) not in sys.path:
 from mm26.pipeline import (
     PipelineConfig,
     _aggregate_consensus_lines,
+    _build_cbbd_games_clean,
+    _build_cbbd_lines_clean,
     _build_cbbd_configuration,
     _load_env_value,
     _normalize_game_team_record,
@@ -28,15 +30,25 @@ class FakeApiBundle:
     def get_games(self, **kwargs):
         return [
             {
-                "gameId": 1,
+                "id": 1,
                 "season": kwargs["season"],
                 "seasonType": "regular",
                 "status": "final",
                 "startDate": "2025-03-01T00:00:00+00:00",
                 "homeTeamId": 10,
                 "homeTeam": "Alpha",
+                "homePoints": 80,
                 "awayTeamId": 20,
                 "awayTeam": "Beta",
+                "awayPoints": 70,
+                "homeTeamEloStart": 1500.0,
+                "homeTeamEloEnd": 1510.0,
+                "awayTeamEloStart": 1490.0,
+                "awayTeamEloEnd": 1480.0,
+                "homeSeed": None,
+                "awaySeed": None,
+                "excitement": 5.5,
+                "gameNotes": None,
             }
         ]
 
@@ -95,7 +107,7 @@ class TestPipelineContracts(unittest.TestCase):
     def test_validation_split_metadata_excludes_holdout_from_train(self) -> None:
         config = PipelineConfig(project_root=ROOT)
         split = _validation_split_metadata(config)
-        self.assertEqual(split["train_start_season"], 2006)
+        self.assertEqual(split["train_start_season"], 2016)
         self.assertEqual(split["train_end_season"], 2024)
         self.assertEqual(split["holdout_season"], 2025)
         self.assertEqual(split["prediction_season"], 2026)
@@ -167,11 +179,94 @@ class TestPipelineContracts(unittest.TestCase):
 
         self.assertEqual(sorted(manifest["datasets"].keys()), ["game_teams", "games", "lines"])
         self.assertEqual(manifest["datasets"]["games"]["status"], "ok")
+        self.assertGreater(manifest["datasets"]["games"]["rows"], 0)
+        self.assertEqual(manifest["datasets"]["game_teams"]["status"], "ok")
         self.assertGreater(manifest["datasets"]["game_teams"]["rows"], 0)
         self.assertGreater(manifest["datasets"]["lines"]["rows"], 0)
         self.assertTrue((config.bronze_dir / "cbbd" / "games.parquet").exists())
         self.assertTrue((config.bronze_dir / "cbbd" / "game_teams.parquet").exists())
         self.assertTrue((config.bronze_dir / "cbbd" / "lines.parquet").exists())
+
+    def test_clean_cbbd_games_and_lines_include_mapped_team_ids(self) -> None:
+        config = PipelineConfig(project_root=ROOT)
+        config.artifacts_dir = ROOT / "artifacts_test"
+        if config.artifacts_dir.exists():
+            shutil.rmtree(config.artifacts_dir)
+        self.addCleanup(lambda: shutil.rmtree(config.artifacts_dir, ignore_errors=True))
+
+        cbbd_dir = config.bronze_dir / "cbbd"
+        cbbd_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "game_id": [1],
+                "season": [2025],
+                "season_type": ["regular"],
+                "status": ["final"],
+                "start_date": ["2025-03-01T00:00:00+00:00"],
+                "home_team_id": [10],
+                "home_team": ["Alpha"],
+                "away_team_id": [20],
+                "away_team": ["Beta"],
+                "home_score": [80.0],
+                "away_score": [70.0],
+                "neutral_site": [False],
+                "conference_game": [False],
+                "notes": [None],
+                "home_elo_start": [1500.0],
+                "home_elo_end": [1510.0],
+                "away_elo_start": [1490.0],
+                "away_elo_end": [1480.0],
+                "home_seed": [None],
+                "away_seed": [None],
+                "excitement": [5.5],
+            }
+        ).write_parquet(cbbd_dir / "games.parquet")
+
+        pl.DataFrame(
+            {
+                "game_id": [1],
+                "season": [2025],
+                "season_type": ["regular"],
+                "start_date": ["2025-03-01T00:00:00+00:00"],
+                "home_team_id": [10],
+                "home_team": ["Alpha"],
+                "away_team_id": [20],
+                "away_team": ["Beta"],
+                "home_score": [80.0],
+                "away_score": [70.0],
+                "provider": ["A"],
+                "spread": [-3.5],
+                "spread_open": [-2.5],
+                "over_under": [145.0],
+                "over_under_open": [144.0],
+                "home_moneyline": [110.0],
+                "away_moneyline": [-120.0],
+            }
+        ).write_parquet(cbbd_dir / "lines.parquet")
+
+        team_map = pl.DataFrame(
+            {
+                "cbbd_team_id": [10, 20],
+                "team_id": [100, 200],
+            }
+        )
+
+        games_clean = _build_cbbd_games_clean(config, team_map)
+        lines_clean = _build_cbbd_lines_clean(config, team_map)
+
+        self.assertIn("kaggle_home_team_id", games_clean.columns)
+        self.assertIn("kaggle_away_team_id", games_clean.columns)
+        self.assertIn("team_low", games_clean.columns)
+        self.assertIn("team_high", games_clean.columns)
+        self.assertEqual(games_clean.select("kaggle_home_team_id").to_series()[0], 100)
+        self.assertEqual(games_clean.select("kaggle_away_team_id").to_series()[0], 200)
+
+        self.assertIn("kaggle_home_team_id", lines_clean.columns)
+        self.assertIn("kaggle_away_team_id", lines_clean.columns)
+        self.assertIn("team_low", lines_clean.columns)
+        self.assertIn("team_high", lines_clean.columns)
+        self.assertEqual(lines_clean.select("kaggle_home_team_id").to_series()[0], 100)
+        self.assertEqual(lines_clean.select("kaggle_away_team_id").to_series()[0], 200)
 
 
 if __name__ == "__main__":

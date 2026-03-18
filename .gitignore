@@ -16,8 +16,6 @@ wheels/
 .idea/
 *.iml
 
-AGENTS.md
-
 # Environment variable files
 .env
 .env.local

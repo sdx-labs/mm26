@@ -28,7 +28,7 @@ class PipelineConfig:
     run_id: str = field(init=False)
     target_season: int = 2026
     mode: str = "manual"
-    cbbd_history_start: int = 2006
+    cbbd_history_start: int = 2016
     cbbd_history_end: int = 2025
     holdout_season: int = 2025
     daily_completed_lookback_days: int = 3
@@ -134,6 +134,13 @@ def _empty_cbbd_games_df() -> pl.DataFrame:
             "neutral_site": pl.Boolean,
             "conference_game": pl.Boolean,
             "notes": pl.Utf8,
+            "home_elo_start": pl.Float64,
+            "home_elo_end": pl.Float64,
+            "away_elo_start": pl.Float64,
+            "away_elo_end": pl.Float64,
+            "home_seed": pl.Float64,
+            "away_seed": pl.Float64,
+            "excitement": pl.Float64,
         }
     )
 
@@ -260,6 +267,15 @@ def _flatten_nested(prefix: str, value: Any, output: dict[str, Any]) -> None:
     output[prefix] = value
 
 
+def _coerce_str(value: Any) -> str | None:
+    """Convert enum-like API values to plain strings."""
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
 def _normalize_api_payload(item: Any) -> dict[str, Any]:
     if hasattr(item, "to_dict"):
         return item.to_dict()
@@ -268,22 +284,29 @@ def _normalize_api_payload(item: Any) -> dict[str, Any]:
 
 def _normalize_game_record(payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        "game_id": payload.get("gameId"),
+        "game_id": payload.get("id"),
         "season": payload.get("season"),
-        "season_type": payload.get("seasonType"),
-        "status": payload.get("status"),
+        "season_type": _coerce_str(payload.get("seasonType")),
+        "status": _coerce_str(payload.get("status")),
         "start_date": str(payload.get("startDate")) if payload.get("startDate") is not None else None,
         "home_team_id": payload.get("homeTeamId"),
         "home_team": payload.get("homeTeam"),
         "home_conference": payload.get("homeConference"),
-        "home_score": payload.get("homeScore"),
+        "home_score": payload.get("homePoints"),
         "away_team_id": payload.get("awayTeamId"),
         "away_team": payload.get("awayTeam"),
         "away_conference": payload.get("awayConference"),
-        "away_score": payload.get("awayScore"),
+        "away_score": payload.get("awayPoints"),
         "neutral_site": payload.get("neutralSite"),
         "conference_game": payload.get("conferenceGame"),
-        "notes": payload.get("notes"),
+        "notes": payload.get("gameNotes"),
+        "home_elo_start": payload.get("homeTeamEloStart"),
+        "home_elo_end": payload.get("homeTeamEloEnd"),
+        "away_elo_start": payload.get("awayTeamEloStart"),
+        "away_elo_end": payload.get("awayTeamEloEnd"),
+        "home_seed": payload.get("homeSeed"),
+        "away_seed": payload.get("awaySeed"),
+        "excitement": payload.get("excitement"),
     }
 
 
@@ -291,7 +314,7 @@ def _normalize_game_team_record(payload: dict[str, Any]) -> dict[str, Any]:
     row: dict[str, Any] = {
         "game_id": payload.get("gameId"),
         "season": payload.get("season"),
-        "season_type": payload.get("seasonType"),
+        "season_type": _coerce_str(payload.get("seasonType")),
         "start_date": str(payload.get("startDate")) if payload.get("startDate") is not None else None,
         "team_id": payload.get("teamId"),
         "team": payload.get("team"),
@@ -316,7 +339,7 @@ def _normalize_line_record(payload: dict[str, Any]) -> list[dict[str, Any]]:
     base = {
         "game_id": payload.get("gameId"),
         "season": payload.get("season"),
-        "season_type": payload.get("seasonType"),
+        "season_type": _coerce_str(payload.get("seasonType")),
         "start_date": str(payload.get("startDate")) if payload.get("startDate") is not None else None,
         "home_team_id": payload.get("homeTeamId"),
         "home_team": payload.get("homeTeam"),
@@ -493,9 +516,9 @@ def ingest_cbbd(
         for row in _normalize_line_record(_normalize_api_payload(item))
     ]
 
-    games_df = pl.DataFrame(games_rows) if games_rows else _empty_cbbd_games_df()
-    game_teams_df = pl.DataFrame(game_team_rows) if game_team_rows else _empty_cbbd_game_teams_df()
-    lines_df = pl.DataFrame(line_rows) if line_rows else _empty_cbbd_lines_df()
+    games_df = pl.DataFrame(games_rows, schema=_empty_cbbd_games_df().schema) if games_rows else _empty_cbbd_games_df()
+    game_teams_df = pl.DataFrame(game_team_rows, schema=_empty_cbbd_game_teams_df().schema) if game_team_rows else _empty_cbbd_game_teams_df()
+    lines_df = pl.DataFrame(line_rows, schema=_empty_cbbd_lines_df().schema) if line_rows else _empty_cbbd_lines_df()
 
     if games_df.height > 0:
         games_df = games_df.unique(subset=["game_id"], keep="last")
@@ -565,6 +588,18 @@ def run_validations(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> 
         results["failed"] = True
 
     results["cbbd_manifest_shape"] = sorted(ingest_manifest["cbbd"]["datasets"].keys())
+    if config.mode == "daily":
+        cbbd_datasets = ingest_manifest["cbbd"]["datasets"]
+        games_ok = cbbd_datasets.get("games", {}).get("status") == "ok" and cbbd_datasets.get("games", {}).get("rows", 0) > 0
+        lines_ok = cbbd_datasets.get("lines", {}).get("status") == "ok" and cbbd_datasets.get("lines", {}).get("rows", 0) > 0
+        results["checks"].append(
+            {
+                "dataset": "CBBD_daily_games_lines",
+                "ok": bool(games_ok and lines_ok),
+                "games_rows": cbbd_datasets.get("games", {}).get("rows", 0),
+                "lines_rows": cbbd_datasets.get("lines", {}).get("rows", 0),
+            }
+        )
     report_path = config.reports_dir / "validation_report.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(results, indent=2, default=_json_default), encoding="utf-8")
@@ -773,6 +808,54 @@ def _build_cbbd_game_fact(config: PipelineConfig, team_map: pl.DataFrame) -> pl.
     )
 
 
+def _build_cbbd_games_clean(config: PipelineConfig, team_map: pl.DataFrame) -> pl.DataFrame:
+    games = _read_parquet(config.bronze_dir / "cbbd" / "games.parquet")
+    if games.height == 0:
+        return games
+
+    cbbd_map = team_map.select(
+        pl.col("cbbd_team_id").cast(pl.Int64),
+        pl.col("team_id").cast(pl.Int64).alias("kaggle_team_id"),
+    ).drop_nulls().unique()
+    home_map = cbbd_map.rename({"cbbd_team_id": "home_team_id", "kaggle_team_id": "kaggle_home_team_id"})
+    away_map = cbbd_map.rename({"cbbd_team_id": "away_team_id", "kaggle_team_id": "kaggle_away_team_id"})
+
+    return (
+        games.join(home_map, on="home_team_id", how="left")
+        .join(away_map, on="away_team_id", how="left")
+        .with_columns(
+            pl.col("start_date").str.slice(0, 10).alias("game_date"),
+            pl.min_horizontal("kaggle_home_team_id", "kaggle_away_team_id").alias("team_low"),
+            pl.max_horizontal("kaggle_home_team_id", "kaggle_away_team_id").alias("team_high"),
+        )
+        .sort(["season", "start_date", "game_id"])
+    )
+
+
+def _build_cbbd_lines_clean(config: PipelineConfig, team_map: pl.DataFrame) -> pl.DataFrame:
+    lines = _read_parquet(config.bronze_dir / "cbbd" / "lines.parquet")
+    if lines.height == 0:
+        return lines
+
+    cbbd_map = team_map.select(
+        pl.col("cbbd_team_id").cast(pl.Int64),
+        pl.col("team_id").cast(pl.Int64).alias("kaggle_team_id"),
+    ).drop_nulls().unique()
+    home_map = cbbd_map.rename({"cbbd_team_id": "home_team_id", "kaggle_team_id": "kaggle_home_team_id"})
+    away_map = cbbd_map.rename({"cbbd_team_id": "away_team_id", "kaggle_team_id": "kaggle_away_team_id"})
+
+    return (
+        lines.join(home_map, on="home_team_id", how="left")
+        .join(away_map, on="away_team_id", how="left")
+        .with_columns(
+            pl.col("start_date").str.slice(0, 10).alias("game_date"),
+            pl.min_horizontal("kaggle_home_team_id", "kaggle_away_team_id").alias("team_low"),
+            pl.max_horizontal("kaggle_home_team_id", "kaggle_away_team_id").alias("team_high"),
+        )
+        .sort(["season", "start_date", "game_id", "provider"])
+    )
+
+
 def _build_cbbd_coverage_summary(cbbd_game_fact: pl.DataFrame) -> dict[str, Any]:
     if cbbd_game_fact.height == 0:
         return {"seasons": [], "rows": 0}
@@ -860,6 +943,8 @@ def run_transform(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> di
     cbbd_game_fact = _build_cbbd_game_fact(config, team_id_map)
     cbbd_lines = _read_parquet(config.bronze_dir / "cbbd" / "lines.parquet")
     cbbd_line_consensus = _attach_kaggle_team_ids_to_consensus(_aggregate_consensus_lines(cbbd_lines), team_id_map)
+    cbbd_games_clean = _build_cbbd_games_clean(config, team_id_map)
+    cbbd_lines_clean = _build_cbbd_lines_clean(config, team_id_map)
     coverage_summary = _build_cbbd_coverage_summary(cbbd_game_fact)
 
     _write_parquet(team_dim, config.silver_dir / "team_dim.parquet")
@@ -868,6 +953,8 @@ def run_transform(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> di
     _write_parquet(quality_flags, config.silver_dir / "quality_flags.parquet")
     _write_parquet(cbbd_game_fact, config.silver_dir / "cbbd_game_fact.parquet")
     _write_parquet(cbbd_line_consensus, config.silver_dir / "cbbd_line_consensus.parquet")
+    _write_parquet(cbbd_games_clean, config.silver_dir / "cbbd_games.parquet")
+    _write_parquet(cbbd_lines_clean, config.silver_dir / "cbbd_lines.parquet")
 
     team_id_map.write_csv(config.reports_dir / "team_id_map_report.csv")
     (config.reports_dir / "team_id_map_summary.json").write_text(json.dumps(map_summary, indent=2, default=_json_default), encoding="utf-8")
@@ -880,6 +967,8 @@ def run_transform(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> di
         "team_id_map_summary": map_summary,
         "cbbd_game_fact_rows": cbbd_game_fact.height,
         "cbbd_line_consensus_rows": cbbd_line_consensus.height,
+        "cbbd_games_rows": cbbd_games_clean.height,
+        "cbbd_lines_rows": cbbd_lines_clean.height,
         "cbbd_coverage_summary": coverage_summary,
     }
 
