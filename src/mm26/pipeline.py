@@ -112,6 +112,7 @@ def _required_kaggle_schemas() -> dict[str, list[str]]:
         "MNCAATourneyCompactResults": ["Season", "DayNum", "WTeamID", "LTeamID", "WScore", "LScore"],
         "WNCAATourneyCompactResults": ["Season", "DayNum", "WTeamID", "LTeamID", "WScore", "LScore"],
         "MTeamSpellings": ["TeamNameSpelling", "TeamID"],
+        "MMasseyOrdinals": ["Season", "RankingDayNum", "SystemName", "TeamID", "OrdinalRank"],
         "SampleSubmissionStage2": ["ID", "Pred"],
     }
 
@@ -1312,6 +1313,55 @@ def _compute_quality_scores(game_fact: pl.DataFrame, alpha: float = 1.0,
     return df
 
 
+def _load_massey_features(ingest_manifest: dict[str, Any]) -> pl.DataFrame:
+    """Load Massey ordinal rankings and compute per-team aggregate features.
+
+    Uses the latest pre-tournament rankings (RankingDayNum <= 133) per system
+    per season, then aggregates across all systems for each (season, team).
+    Returns (sex='M', season, team_id, massey_avg_rank, massey_median_rank,
+    massey_best_rank, massey_system_count).
+    """
+    files = ingest_manifest["kaggle"]["files"]
+    if "MMasseyOrdinals" not in files:
+        return pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "team_id": pl.Int64,
+            "massey_avg_rank": pl.Float64, "massey_median_rank": pl.Float64,
+            "massey_best_rank": pl.Float64, "massey_system_count": pl.Int64,
+        })
+
+    ordinals = _read_parquet(Path(files["MMasseyOrdinals"]["artifact"]))
+    # Get the latest available ranking day (<=133) per system per season
+    pre_tourney = ordinals.filter(pl.col("RankingDayNum") <= 133)
+    latest_day = (
+        pre_tourney.group_by(["Season", "SystemName"])
+        .agg(pl.col("RankingDayNum").max().alias("max_day"))
+    )
+    final = (
+        pre_tourney.join(latest_day, on=["Season", "SystemName"])
+        .filter(pl.col("RankingDayNum") == pl.col("max_day"))
+        .drop("max_day")
+    )
+
+    # Aggregate across all systems for each (season, team)
+    agg = (
+        final.group_by(["Season", "TeamID"])
+        .agg(
+            pl.col("OrdinalRank").mean().alias("massey_avg_rank"),
+            pl.col("OrdinalRank").median().alias("massey_median_rank"),
+            pl.col("OrdinalRank").min().alias("massey_best_rank"),
+            pl.col("OrdinalRank").count().alias("massey_system_count"),
+        )
+        .with_columns(
+            pl.lit("M").alias("sex"),
+            pl.col("Season").alias("season"),
+            pl.col("TeamID").cast(pl.Int64).alias("team_id"),
+        )
+        .select("sex", "season", "team_id", "massey_avg_rank", "massey_median_rank",
+                "massey_best_rank", "massey_system_count")
+    )
+    return agg
+
+
 def _load_seed_map(ingest_manifest: dict[str, Any]) -> pl.DataFrame:
     """Load tournament seeds for M and W, extracting numeric seed."""
     files = ingest_manifest["kaggle"]["files"]
@@ -1494,6 +1544,11 @@ def _build_team_season_features(
             ((pl.col("total_reb_margin")) / pl.col("games_played")).alias("avg_reb_margin"),
             (pl.col("avg_ast") / pl.col("avg_tov").clip(0.1, None)).alias("ast_to_ratio"),
             (pl.col("avg_stl") + pl.col("avg_blk")).alias("avg_stl_blk"),
+            # Tempo-free efficiency metrics (per 100 possessions)
+            (100.0 * pl.col("avg_pts_for") / pl.col("avg_possessions").clip(40.0, None)).alias("off_rating"),
+            (100.0 * pl.col("avg_pts_against") / pl.col("avg_possessions").clip(40.0, None)).alias("def_rating"),
+        ).with_columns(
+            (pl.col("off_rating") - pl.col("def_rating")).alias("net_rating"),
         ).drop("total_reb_margin")
     else:
         features = features.with_columns(
@@ -1512,6 +1567,9 @@ def _build_team_season_features(
             pl.lit(None, dtype=pl.Float64).alias("avg_reb_margin"),
             pl.lit(None, dtype=pl.Float64).alias("ast_to_ratio"),
             pl.lit(None, dtype=pl.Float64).alias("avg_stl_blk"),
+            pl.lit(None, dtype=pl.Float64).alias("off_rating"),
+            pl.lit(None, dtype=pl.Float64).alias("def_rating"),
+            pl.lit(None, dtype=pl.Float64).alias("net_rating"),
         )
 
     # Join season-end ELO (last elo_after before day 133)
@@ -1734,6 +1792,21 @@ def _compute_diff_features(paired: pl.DataFrame) -> pl.DataFrame:
             (pl.col("avg_possessions_low").fill_null(65.0) - pl.col("avg_possessions_high").fill_null(65.0)).alias("diff_possessions"),
         ])
 
+    # Tempo-free efficiency diffs
+    if "off_rating_low" in paired.columns:
+        diffs.extend([
+            (pl.col("off_rating_low").fill_null(100.0) - pl.col("off_rating_high").fill_null(100.0)).alias("diff_off_rating"),
+            (pl.col("def_rating_high").fill_null(100.0) - pl.col("def_rating_low").fill_null(100.0)).alias("diff_def_rating"),
+            (pl.col("net_rating_low").fill_null(0.0) - pl.col("net_rating_high").fill_null(0.0)).alias("diff_net_rating"),
+        ])
+
+    # Massey ordinal features
+    if "massey_avg_rank_low" in paired.columns:
+        diffs.extend([
+            (pl.col("massey_avg_rank_high").fill_null(175.0) - pl.col("massey_avg_rank_low").fill_null(175.0)).alias("diff_massey_rank"),
+            (pl.col("massey_best_rank_high").fill_null(175.0) - pl.col("massey_best_rank_low").fill_null(175.0)).alias("diff_massey_best"),
+        ])
+
     # Seed interaction features
     diffs.append(
         (pl.col("seed_low").fill_null(8).cast(pl.Float64) * pl.col("seed_high").fill_null(8).cast(pl.Float64)).alias("seed_product")
@@ -1850,11 +1923,11 @@ def _build_training_pairs(
     return _compute_diff_features(paired)
 
 
-def _train_model(train_df: pl.DataFrame, feature_cols: list[str], n_estimators: int = 500,
-                 max_depth: int = 5, learning_rate: float = 0.04,
-                 subsample: float = 0.8, colsample_bytree: float = 0.7,
-                 min_child_weight: int = 3, gamma: float = 0.1,
-                 reg_alpha: float = 0.1, reg_lambda: float = 2.0) -> Any:
+def _train_model(train_df: pl.DataFrame, feature_cols: list[str], n_estimators: int = 800,
+                 max_depth: int = 4, learning_rate: float = 0.03,
+                 subsample: float = 0.8, colsample_bytree: float = 0.6,
+                 min_child_weight: int = 5, gamma: float = 0.2,
+                 reg_alpha: float = 0.15, reg_lambda: float = 3.0) -> Any:
     if train_df.height == 0:
         return None
     cleaned = train_df.select(
@@ -1862,12 +1935,15 @@ def _train_model(train_df: pl.DataFrame, feature_cols: list[str], n_estimators: 
     ).drop_nulls()
     if cleaned.height == 0:
         return None
-    y_values = cleaned.select("target_low_wins").to_series().to_list()
-    if len(set(y_values)) < 2:
+    y_values = cleaned.select("target_low_wins").to_series().to_numpy().astype(np.float64)
+    if len(set(y_values.tolist())) < 2:
         return None
     x_values = cleaned.select(feature_cols).to_numpy()
 
     if XGBClassifier is not None:
+        n = len(y_values)
+        use_early_stopping = n >= 200  # Need enough data for a meaningful val split
+
         model = XGBClassifier(
             n_estimators=n_estimators,
             max_depth=max_depth,
@@ -1879,9 +1955,22 @@ def _train_model(train_df: pl.DataFrame, feature_cols: list[str], n_estimators: 
             reg_alpha=reg_alpha,
             reg_lambda=reg_lambda,
             eval_metric="logloss",
+            early_stopping_rounds=50 if use_early_stopping else None,
             verbosity=0,
         )
-        model.fit(x_values, y_values)
+
+        if use_early_stopping:
+            n_val = max(30, int(n * 0.15))
+            rng = np.random.RandomState(42)
+            indices = rng.permutation(n)
+            train_idx, val_idx = indices[n_val:], indices[:n_val]
+            model.fit(
+                x_values[train_idx], y_values[train_idx],
+                eval_set=[(x_values[val_idx], y_values[val_idx])],
+                verbose=False,
+            )
+        else:
+            model.fit(x_values, y_values)
         return model
 
     if LogisticRegression is not None:
@@ -1905,7 +1994,7 @@ def _time_series_cv_brier(training: pl.DataFrame, feature_cols: list[str],
         if train_fold.height < 50 or test_fold.height == 0:
             continue
 
-        model = _train_model(train_fold, feature_cols, **model_kwargs)
+        model = _train_ensemble(train_fold, feature_cols, **model_kwargs)
         if model is None:
             continue
 
@@ -1916,6 +2005,71 @@ def _time_series_cv_brier(training: pl.DataFrame, feature_cols: list[str],
 
     avg_brier = float(np.mean(fold_briers)) if fold_briers else 1.0
     return avg_brier, fold_briers
+
+
+class _EnsembleModel:
+    """Blends XGBoost and Logistic Regression predictions for smoother Brier scores."""
+
+    def __init__(self, xgb_model: Any, lr_model: Any, blend_alpha: float = 0.7):
+        self.xgb_model = xgb_model
+        self.lr_model = lr_model
+        self.blend_alpha = blend_alpha
+
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        xgb_proba = self.xgb_model.predict_proba(x)[:, 1] if self.xgb_model is not None else np.full(x.shape[0], 0.5)
+        lr_proba = self.lr_model.predict_proba(x)[:, 1] if self.lr_model is not None else np.full(x.shape[0], 0.5)
+        blended = self.blend_alpha * xgb_proba + (1.0 - self.blend_alpha) * lr_proba
+        # Return in sklearn format (2-column)
+        return np.column_stack([1.0 - blended, blended])
+
+    @property
+    def feature_importances_(self) -> np.ndarray | None:
+        if self.xgb_model is not None and hasattr(self.xgb_model, "feature_importances_"):
+            return self.xgb_model.feature_importances_
+        return None
+
+
+def _train_ensemble(train_df: pl.DataFrame, feature_cols: list[str],
+                    blend_alpha: float = 0.7, **xgb_kwargs: Any) -> Any:
+    """Train an XGBoost + Logistic Regression ensemble."""
+    if train_df.height == 0:
+        return None
+    cleaned = train_df.select(
+        [pl.col(c).fill_null(0.0) for c in feature_cols] + [pl.col("target_low_wins")]
+    ).drop_nulls()
+    if cleaned.height == 0:
+        return None
+    y_values = cleaned.select("target_low_wins").to_series().to_numpy().astype(np.float64)
+    if len(set(y_values.tolist())) < 2:
+        return None
+
+    from sklearn.preprocessing import StandardScaler
+
+    x_values = cleaned.select(feature_cols).to_numpy()
+
+    xgb_model = _train_model(train_df, feature_cols, **xgb_kwargs)
+
+    lr_model = None
+    if LogisticRegression is not None:
+        scaler = StandardScaler()
+        x_scaled = scaler.fit_transform(x_values)
+
+        class _ScaledLR:
+            def __init__(self, lr: Any, sc: Any):
+                self.lr = lr
+                self.scaler = sc
+
+            def predict_proba(self, x: np.ndarray) -> np.ndarray:
+                return self.lr.predict_proba(self.scaler.transform(x))
+
+        lr = LogisticRegression(max_iter=2000, C=0.5)
+        lr.fit(x_scaled, y_values)
+        lr_model = _ScaledLR(lr, scaler)
+
+    if xgb_model is None and lr_model is None:
+        return None
+
+    return _EnsembleModel(xgb_model, lr_model, blend_alpha=blend_alpha)
 
 
 def _predict_with_model_raw(model: Any, features_df: pl.DataFrame, feature_cols: list[str]) -> np.ndarray:
@@ -1944,7 +2098,7 @@ def _fit_calibration(model: Any, training: pl.DataFrame, feature_cols: list[str]
         if train_fold.height < 50 or test_fold.height == 0:
             continue
 
-        fold_model = _train_model(train_fold, feature_cols)
+        fold_model = _train_ensemble(train_fold, feature_cols)
         if fold_model is None:
             continue
 
@@ -2100,6 +2254,24 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
             pl.lit(None, dtype=pl.Float64).alias("quality"),
         )
 
+    # Load and join Massey ordinal features (Men only for now)
+    massey_features = _load_massey_features(ingest_manifest)
+    if massey_features is not None and massey_features.height > 0:
+        team_features = team_features.join(
+            massey_features.select("sex", "season", "team_id",
+                                   "massey_avg_rank", "massey_median_rank",
+                                   "massey_best_rank", "massey_system_count"),
+            on=["sex", "season", "team_id"],
+            how="left",
+        )
+    else:
+        team_features = team_features.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("massey_avg_rank"),
+            pl.lit(None, dtype=pl.Float64).alias("massey_median_rank"),
+            pl.lit(None, dtype=pl.Float64).alias("massey_best_rank"),
+            pl.lit(None, dtype=pl.Float64).alias("massey_system_count"),
+        )
+
     pairwise_features = _pair_features_from_ids(sample.select("ID"), team_features, cbbd_line_consensus, seed_map)
     training = _build_training_pairs(ingest_manifest, team_features, config.target_season, seed_map)
 
@@ -2133,6 +2305,11 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         "diff_heat_volatility",
         "diff_quality",
         "diff_quality_minus_elo",
+        "diff_off_rating",
+        "diff_def_rating",
+        "diff_net_rating",
+        "diff_massey_rank",
+        "diff_massey_best",
     ]
     # Keep only feature columns that actually exist in both training and prediction data
     available_train_cols = set(training.columns) if training.height > 0 else set()
@@ -2155,7 +2332,7 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
             holdout = pl.DataFrame(schema=train_sex.schema)
             n_est = 400
 
-        model = _train_model(train_fit, feature_cols, n_estimators=n_est)
+        model = _train_ensemble(train_fit, feature_cols, blend_alpha=0.7, n_estimators=n_est)
 
         # Fit isotonic calibration on time-series CV out-of-fold predictions
         calibrator = _fit_calibration(model, training, feature_cols, sex=sex)
@@ -2166,20 +2343,79 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
 
         # Holdout Brier score
         holdout_brier = None
+        holdout_diagnostics: dict[str, Any] = {}
         cv_brier = None
         if holdout.height > 0 and model is not None:
             holdout_preds = _predict_with_model(model, holdout, feature_cols, calibrator=calibrator)
             actuals = holdout.select("target_low_wins").to_series().to_numpy().astype(np.float64)
-            holdout_brier = float(np.mean((holdout_preds.to_numpy() - actuals) ** 2))
+            preds_np = holdout_preds.to_numpy()
+            holdout_brier = float(np.mean((preds_np - actuals) ** 2))
+
+            # ECE (Expected Calibration Error) — 10 equal-width bins
+            n_bins = 10
+            bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+            ece = 0.0
+            bin_details = []
+            for i in range(n_bins):
+                mask = (preds_np >= bin_edges[i]) & (preds_np < bin_edges[i + 1])
+                if i == n_bins - 1:
+                    mask = (preds_np >= bin_edges[i]) & (preds_np <= bin_edges[i + 1])
+                count = int(mask.sum())
+                if count > 0:
+                    avg_pred = float(preds_np[mask].mean())
+                    avg_actual = float(actuals[mask].mean())
+                    ece += abs(avg_pred - avg_actual) * count
+                    bin_details.append({"bin": f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}", "count": count,
+                                        "avg_pred": round(avg_pred, 4), "avg_actual": round(avg_actual, 4)})
+            ece = ece / len(actuals) if len(actuals) > 0 else None
+            holdout_diagnostics["ece"] = round(ece, 6) if ece is not None else None
+            holdout_diagnostics["calibration_bins"] = bin_details
+
+            # Per-seed Brier (using lower-seeded team's seed)
+            if "seed_low" in holdout.columns:
+                seed_brier = {}
+                seeds = holdout.select("seed_low").to_series().to_numpy()
+                for s in sorted(set(seeds)):
+                    s_mask = seeds == s
+                    if s_mask.sum() > 0:
+                        seed_brier[int(s)] = round(float(np.mean((preds_np[s_mask] - actuals[s_mask]) ** 2)), 6)
+                holdout_diagnostics["per_seed_brier"] = seed_brier
+
+            # Brier decomposition: reliability, resolution, uncertainty
+            mean_actual = float(actuals.mean())
+            uncertainty = mean_actual * (1.0 - mean_actual)
+            holdout_diagnostics["brier_decomposition"] = {
+                "uncertainty": round(uncertainty, 6),
+                "base_rate": round(mean_actual, 4),
+            }
 
         # Time-series CV Brier
         if sex == "M":
             cv_brier_val, cv_folds = _time_series_cv_brier(training, feature_cols, sex=sex)
             cv_brier = {"mean": cv_brier_val, "folds": cv_folds}
+        elif sex == "W" and train_sex.height > 0:
+            cv_brier_val, cv_folds = _time_series_cv_brier(training, feature_cols, sex=sex)
+            if cv_brier_val is not None:
+                cv_brier = {"mean": cv_brier_val, "folds": cv_folds}
 
         model_type = "flat_fallback"
         if model is not None:
-            model_type = "xgboost" if XGBClassifier is not None and isinstance(model, XGBClassifier) else "logistic_regression"
+            if isinstance(model, _EnsembleModel):
+                model_type = "ensemble_xgb_lr"
+            elif XGBClassifier is not None and isinstance(model, XGBClassifier):
+                model_type = "xgboost"
+            else:
+                model_type = "logistic_regression"
+
+        # Feature importance
+        feature_importance = {}
+        if model is not None and hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
+            if importances is not None:
+                feature_importance = {
+                    fc: round(float(imp), 6)
+                    for fc, imp in sorted(zip(feature_cols, importances), key=lambda x: -x[1])
+                }
 
         model_stats[sex] = {
             "train_rows": train_fit.height,
@@ -2188,8 +2424,10 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
             "model_type": model_type,
             "good_train_rows": train_fit.select(feature_cols).drop_nulls().height,
             "holdout_brier": holdout_brier,
+            "holdout_diagnostics": holdout_diagnostics if holdout_diagnostics else None,
             "cv_brier": cv_brier,
             "calibrated": calibrator is not None,
+            "feature_importance": feature_importance if feature_importance else None,
         }
 
     submission = pl.concat(predictions, how="vertical")
