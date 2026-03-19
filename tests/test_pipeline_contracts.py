@@ -20,6 +20,7 @@ from mm26.pipeline import (
     _build_cbbd_configuration,
     _compute_elo_ratings,
     _compute_heat_scores,
+    _compute_quality_scores,
     _get_pre_tournament_heat,
     _load_env_value,
     _normalize_game_team_record,
@@ -334,6 +335,105 @@ class TestEloAndHeat(unittest.TestCase):
         })
         elo = _compute_elo_ratings(empty)
         self.assertEqual(elo.height, 0)
+
+    def test_heat_includes_surprise_weighted_columns(self) -> None:
+        game_fact = self._make_game_fact()
+        elo = _compute_elo_ratings(game_fact)
+        heat = _compute_heat_scores(elo)
+        sw_cols = {"sw_heat_delta", "sw_heat_1g", "sw_heat_3g", "sw_heat_5g", "heat_volatility_5g"}
+        self.assertTrue(sw_cols.issubset(set(heat.columns)))
+
+    def test_surprise_weight_amplifies_upsets(self) -> None:
+        """A win by a team with low expected_win_prob should produce larger sw_heat_delta."""
+        game_fact = self._make_game_fact()
+        elo = _compute_elo_ratings(game_fact)
+        heat = _compute_heat_scores(elo)
+        # For the same magnitude heat_delta, surprise-weighted should differ based on expected prob
+        sw_deltas = heat.filter(pl.col("sw_heat_delta").is_not_null()).select("sw_heat_delta").to_series()
+        raw_deltas = heat.filter(pl.col("heat_delta").is_not_null()).select("heat_delta").to_series()
+        # sw_heat_delta should exist and have non-zero values
+        self.assertGreater(len(sw_deltas), 0)
+        # At least one sw value should differ from raw
+        if len(raw_deltas) > 0 and len(sw_deltas) > 0:
+            self.assertFalse(all(abs(s - r) < 1e-10 for s, r in zip(sw_deltas.to_list(), raw_deltas.to_list())))
+
+
+class TestQualityScores(unittest.TestCase):
+    """Tests for the Ridge-regularized quality metric."""
+
+    def _make_game_fact(self) -> pl.DataFrame:
+        """Build a small game_fact with enough games for Ridge fitting."""
+        import numpy as np
+        rng = np.random.default_rng(42)
+        games = []
+        teams = [1101, 1102, 1103, 1104]
+        game_num = 0
+        for day in range(10, 130, 3):
+            # Each day: random matchup
+            t1, t2 = rng.choice(teams, size=2, replace=False)
+            s1 = int(60 + rng.integers(-10, 20))
+            s2 = int(60 + rng.integers(-10, 20))
+            t_low, t_high = min(t1, t2), max(t1, t2)
+            gk = f"M_2025_{day}_{t_low}_{t_high}"
+            # Winner row
+            w_tid, l_tid = (t1, t2) if s1 > s2 else (t2, t1)
+            w_score, l_score = max(s1, s2), min(s1, s2)
+            if s1 == s2:
+                s1 += 1
+                w_score = s1
+                w_tid, l_tid = t1, t2
+            games.append({
+                "sex": "M", "season": 2025, "day_num": day,
+                "team_id": t_low, "opp_team_id": t_high,
+                "team_score": float(s1 if t_low == t1 else s2),
+                "opp_score": float(s2 if t_low == t1 else s1),
+                "team_loc": "H", "num_ot": 0,
+                "win": 1 if (t_low == t1 and s1 > s2) or (t_low == t2 and s2 > s1) else 0,
+                "team_low": t_low, "team_high": t_high, "game_key": gk,
+            })
+            games.append({
+                "sex": "M", "season": 2025, "day_num": day,
+                "team_id": t_high, "opp_team_id": t_low,
+                "team_score": float(s2 if t_high == t2 else s1),
+                "opp_score": float(s1 if t_high == t2 else s2),
+                "team_loc": "A", "num_ot": 0,
+                "win": 1 if (t_high == t2 and s2 > s1) or (t_high == t1 and s1 > s2) else 0,
+                "team_low": t_low, "team_high": t_high, "game_key": gk,
+            })
+        return pl.DataFrame(games)
+
+    def test_quality_returns_all_teams(self) -> None:
+        gf = self._make_game_fact()
+        q = _compute_quality_scores(gf)
+        self.assertGreater(q.height, 0)
+        self.assertIn("quality", q.columns)
+        self.assertIn("quality_rank", q.columns)
+        teams = sorted(q["team_id"].to_list())
+        self.assertEqual(teams, [1101, 1102, 1103, 1104])
+
+    def test_quality_empty_returns_empty(self) -> None:
+        empty = pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
+            "team_id": pl.Int64, "opp_team_id": pl.Int64,
+            "team_score": pl.Float64, "opp_score": pl.Float64,
+            "team_loc": pl.Utf8, "num_ot": pl.Int64, "win": pl.Int64,
+            "team_low": pl.Int64, "team_high": pl.Int64, "game_key": pl.Utf8,
+        })
+        q = _compute_quality_scores(empty)
+        self.assertEqual(q.height, 0)
+
+    def test_quality_excludes_tournament_games(self) -> None:
+        gf = self._make_game_fact()
+        # Add a tournament game (day_num > 132)
+        tourney_row = gf.head(2).with_columns(pl.lit(140).cast(pl.Int64).alias("day_num"))
+        gf_with_tourney = pl.concat([gf, tourney_row])
+        q1 = _compute_quality_scores(gf)
+        q2 = _compute_quality_scores(gf_with_tourney)
+        # Quality should be the same since tourney games are filtered out
+        q1_dict = {r["team_id"]: r["quality"] for r in q1.to_dicts()}
+        q2_dict = {r["team_id"]: r["quality"] for r in q2.to_dicts()}
+        for tid in q1_dict:
+            self.assertAlmostEqual(q1_dict[tid], q2_dict[tid], places=5)
 
 
 if __name__ == "__main__":

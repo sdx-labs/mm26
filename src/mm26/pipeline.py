@@ -29,6 +29,11 @@ try:
 except Exception:  # pragma: no cover
     IsotonicRegression = None
 
+try:
+    from sklearn.linear_model import Ridge
+except Exception:  # pragma: no cover
+    Ridge = None
+
 
 @dataclass
 class PipelineConfig:
@@ -1142,17 +1147,36 @@ def _compute_elo_ratings(game_fact: pl.DataFrame, k_factor: float = 20.0,
 # ---------------------------------------------------------------------------
 
 def _compute_heat_scores(elo_ratings: pl.DataFrame) -> pl.DataFrame:
-    """Rolling over-performance relative to ELO expectations."""
+    """Rolling over-performance relative to ELO expectations with surprise weighting.
+
+    Surprise weight uses Shannon information content: w = -log2(p_expected)
+    where p_expected is the ELO-based probability of the observed outcome.
+    Upsets get amplified; expected results get dampened.
+    """
+    empty_schema = {
+        "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
+        "team_id": pl.Int64, "heat_delta": pl.Float64,
+        "heat_1g": pl.Float64, "heat_3g": pl.Float64, "heat_5g": pl.Float64,
+        "sw_heat_delta": pl.Float64,
+        "sw_heat_1g": pl.Float64, "sw_heat_3g": pl.Float64, "sw_heat_5g": pl.Float64,
+        "heat_volatility_5g": pl.Float64,
+    }
     if elo_ratings.height == 0:
-        return pl.DataFrame(schema={
-            "sex": pl.Utf8, "season": pl.Int64, "day_num": pl.Int64,
-            "team_id": pl.Int64, "heat_delta": pl.Float64,
-            "heat_1g": pl.Float64, "heat_3g": pl.Float64, "heat_5g": pl.Float64,
-        })
+        return pl.DataFrame(schema=empty_schema)
 
     base = (
         elo_ratings.with_columns(
-            (pl.col("actual_margin").cast(pl.Float64) - pl.col("expected_margin")).alias("heat_delta")
+            (pl.col("actual_margin").cast(pl.Float64) - pl.col("expected_margin")).alias("heat_delta"),
+            # Surprise weight: -log2(p) where p = P(observed outcome)
+            # For wins (actual_win==1): p = expected_win_prob
+            # For losses (actual_win==0): p = 1 - expected_win_prob
+            pl.when(pl.col("actual_win") == 1)
+            .then(-pl.col("expected_win_prob").clip(0.02, 0.98).log(base=2))
+            .otherwise(-(1.0 - pl.col("expected_win_prob").clip(0.02, 0.98)).log(base=2))
+            .alias("_surprise_weight"),
+        )
+        .with_columns(
+            (pl.col("heat_delta") * pl.col("_surprise_weight")).alias("sw_heat_delta")
         )
         .sort(["sex", "season", "team_id", "day_num"])
     )
@@ -1160,14 +1184,33 @@ def _compute_heat_scores(elo_ratings: pl.DataFrame) -> pl.DataFrame:
     lagged = base
     for i in range(1, 6):
         lagged = lagged.with_columns(
-            pl.col("heat_delta").shift(i).over(["sex", "season", "team_id"]).alias(f"_lag{i}")
+            pl.col("heat_delta").shift(i).over(["sex", "season", "team_id"]).alias(f"_lag{i}"),
+            pl.col("sw_heat_delta").shift(i).over(["sex", "season", "team_id"]).alias(f"_sw_lag{i}"),
         )
 
-    return lagged.with_columns(
+    result = lagged.with_columns(
+        # Original heat (backward compatible)
         pl.col("_lag1").alias("heat_1g"),
         pl.mean_horizontal("_lag1", "_lag2", "_lag3").alias("heat_3g"),
         pl.mean_horizontal("_lag1", "_lag2", "_lag3", "_lag4", "_lag5").alias("heat_5g"),
-    ).select("sex", "season", "day_num", "team_id", "heat_delta", "heat_1g", "heat_3g", "heat_5g")
+        # Surprise-weighted heat
+        pl.col("_sw_lag1").alias("sw_heat_1g"),
+        pl.mean_horizontal("_sw_lag1", "_sw_lag2", "_sw_lag3").alias("sw_heat_3g"),
+        pl.mean_horizontal("_sw_lag1", "_sw_lag2", "_sw_lag3", "_sw_lag4", "_sw_lag5").alias("sw_heat_5g"),
+    )
+
+    # Heat volatility: std of last 5 surprise-weighted deltas
+    sw_lag_cols = [f"_sw_lag{i}" for i in range(1, 6)]
+    mean_expr = pl.mean_horizontal(*sw_lag_cols)
+    var_expr = pl.mean_horizontal(*[(pl.col(c) - mean_expr) ** 2 for c in sw_lag_cols])
+    result = result.with_columns(var_expr.sqrt().alias("heat_volatility_5g"))
+
+    return result.select(
+        "sex", "season", "day_num", "team_id",
+        "heat_delta", "heat_1g", "heat_3g", "heat_5g",
+        "sw_heat_delta", "sw_heat_1g", "sw_heat_3g", "sw_heat_5g",
+        "heat_volatility_5g",
+    )
 
 
 def _get_pre_tournament_heat(heat_scores: pl.DataFrame, tourney_cutoff_day: int = 132) -> pl.DataFrame:
@@ -1178,6 +1221,95 @@ def _get_pre_tournament_heat(heat_scores: pl.DataFrame, tourney_cutoff_day: int 
         .group_by(["sex", "season", "team_id"])
         .last()
     )
+
+
+def _compute_quality_scores(game_fact: pl.DataFrame, alpha: float = 1.0,
+                            recency_gamma: float = 0.5) -> pl.DataFrame:
+    """Ridge-regularized schedule-adjusted quality metric (inspired by 25.md).
+
+    For each (season, sex), fits:
+        margin_g = theta_i - theta_j + beta_home * H_g + epsilon
+    with Ridge penalty alpha * ||theta||^2 and exponential recency weights.
+
+    Uses only regular-season games (day_num <= 132) to avoid tournament leakage.
+    Returns (sex, season, team_id, quality, quality_rank).
+    """
+    if Ridge is None or game_fact.height == 0:
+        return pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "team_id": pl.Int64,
+            "quality": pl.Float64, "quality_rank": pl.Int64,
+        })
+
+    # Filter to regular season only (no tournament leakage)
+    reg = (
+        game_fact.filter(pl.col("day_num") <= 132)
+        .filter(pl.col("team_id") == pl.col("team_low"))
+        .select("sex", "season", "day_num", "team_low", "team_high",
+                "team_score", "opp_score", "team_loc")
+    )
+
+    results: list[dict[str, Any]] = []
+
+    for (sex, season), group_df in reg.group_by(["sex", "season"]):
+        rows = group_df.to_dicts()
+        if len(rows) < 30:
+            continue
+
+        # Collect all team IDs in this season-sex
+        team_ids: set[int] = set()
+        for r in rows:
+            team_ids.add(int(r["team_low"]))
+            team_ids.add(int(r["team_high"]))
+        tid_list = sorted(team_ids)
+        tid_to_idx = {t: i for i, t in enumerate(tid_list)}
+        n_teams = len(tid_list)
+
+        # Build design matrix: team indicators + home court
+        n_games = len(rows)
+        X = np.zeros((n_games, n_teams + 1), dtype=np.float64)  # +1 for home indicator
+        y = np.zeros(n_games, dtype=np.float64)
+        w = np.zeros(n_games, dtype=np.float64)
+
+        max_day = max(r["day_num"] for r in rows)
+        for g, r in enumerate(rows):
+            t_low_idx = tid_to_idx[int(r["team_low"])]
+            t_high_idx = tid_to_idx[int(r["team_high"])]
+            X[g, t_low_idx] = 1.0
+            X[g, t_high_idx] = -1.0
+
+            loc = r["team_loc"] if r["team_loc"] else "N"
+            if loc == "H":
+                X[g, n_teams] = 1.0
+            elif loc == "A":
+                X[g, n_teams] = -1.0
+
+            y[g] = float(r["team_score"]) - float(r["opp_score"])
+            # Recency weight: exp(-gamma * (1 - day/max_day))
+            day_frac = float(r["day_num"]) / max_day if max_day > 0 else 1.0
+            w[g] = np.exp(-recency_gamma * (1.0 - day_frac))
+
+        model = Ridge(alpha=alpha, fit_intercept=False)
+        model.fit(X, y, sample_weight=w)
+
+        team_coefs = model.coef_[:n_teams]
+        for tid, idx in tid_to_idx.items():
+            results.append({
+                "sex": sex, "season": season, "team_id": tid,
+                "quality": float(team_coefs[idx]),
+            })
+
+    if not results:
+        return pl.DataFrame(schema={
+            "sex": pl.Utf8, "season": pl.Int64, "team_id": pl.Int64,
+            "quality": pl.Float64, "quality_rank": pl.Int64,
+        })
+
+    df = pl.DataFrame(results)
+    # Rank within (sex, season): rank 1 = best quality
+    df = df.with_columns(
+        pl.col("quality").rank(descending=True).over(["sex", "season"]).cast(pl.Int64).alias("quality_rank")
+    )
+    return df
 
 
 def _load_seed_map(ingest_manifest: dict[str, Any]) -> pl.DataFrame:
@@ -1424,12 +1556,26 @@ def _build_team_season_features(
     # Join pre-tournament heat scores
     if heat_scores is not None and heat_scores.height > 0:
         pre_heat = _get_pre_tournament_heat(heat_scores)
+
+        heat_cols_to_join = ["sex", "season", "team_id", "heat_1g", "heat_3g", "heat_5g"]
+        heat_rename = {
+            "heat_1g": "pre_tourney_heat_1g",
+            "heat_3g": "pre_tourney_heat_3g",
+            "heat_5g": "pre_tourney_heat_5g",
+        }
+
+        # Add surprise-weighted columns if present
+        if "sw_heat_5g" in pre_heat.columns:
+            heat_cols_to_join.extend(["sw_heat_1g", "sw_heat_3g", "sw_heat_5g", "heat_volatility_5g"])
+            heat_rename.update({
+                "sw_heat_1g": "pre_tourney_sw_heat_1g",
+                "sw_heat_3g": "pre_tourney_sw_heat_3g",
+                "sw_heat_5g": "pre_tourney_sw_heat_5g",
+                "heat_volatility_5g": "pre_tourney_heat_volatility_5g",
+            })
+
         features = features.join(
-            pre_heat.select("sex", "season", "team_id", "heat_1g", "heat_3g", "heat_5g").rename({
-                "heat_1g": "pre_tourney_heat_1g",
-                "heat_3g": "pre_tourney_heat_3g",
-                "heat_5g": "pre_tourney_heat_5g",
-            }),
+            pre_heat.select(heat_cols_to_join).rename(heat_rename),
             on=["sex", "season", "team_id"],
             how="left",
         )
@@ -1443,6 +1589,10 @@ def _build_team_season_features(
             pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_1g"),
             pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_3g"),
             pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_5g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_sw_heat_1g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_sw_heat_3g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_sw_heat_5g"),
+            pl.lit(None, dtype=pl.Float64).alias("pre_tourney_heat_volatility_5g"),
             pl.lit(None, dtype=pl.Float64).alias("heat_trend"),
             pl.lit(None, dtype=pl.Float64).alias("abs_heat_5g"),
         )
@@ -1555,6 +1705,16 @@ def _compute_diff_features(paired: pl.DataFrame) -> pl.DataFrame:
             (pl.col("abs_heat_5g_low").fill_null(0.0) - pl.col("abs_heat_5g_high").fill_null(0.0)).alias("diff_abs_heat_5g")
         )
 
+    # Surprise-weighted heat features
+    if "pre_tourney_sw_heat_5g_low" in paired.columns:
+        diffs.append(
+            (pl.col("pre_tourney_sw_heat_5g_low").fill_null(0.0) - pl.col("pre_tourney_sw_heat_5g_high").fill_null(0.0)).alias("diff_sw_heat_5g")
+        )
+    if "pre_tourney_heat_volatility_5g_low" in paired.columns:
+        diffs.append(
+            (pl.col("pre_tourney_heat_volatility_5g_low").fill_null(0.0) - pl.col("pre_tourney_heat_volatility_5g_high").fill_null(0.0)).alias("diff_heat_volatility")
+        )
+
     # SOS
     if "sos_low" in paired.columns:
         diffs.append(
@@ -1582,6 +1742,19 @@ def _compute_diff_features(paired: pl.DataFrame) -> pl.DataFrame:
     # Consensus spread (fill with 0 when missing)
     if "consensus_low_spread" in paired.columns:
         diffs.append(pl.col("consensus_low_spread").fill_null(0.0).alias("consensus_low_spread_filled"))
+
+    # Quality features (Ridge schedule-adjusted quality)
+    if "quality_low" in paired.columns:
+        diffs.append(
+            (pl.col("quality_low").fill_null(0.0) - pl.col("quality_high").fill_null(0.0)).alias("diff_quality")
+        )
+        # Quality minus ELO: captures ELO-quality disagreement
+        if "season_end_elo_low" in paired.columns:
+            diffs.append(
+                ((pl.col("quality_low").fill_null(0.0) - pl.col("quality_high").fill_null(0.0))
+                 - (pl.col("season_end_elo_low").fill_null(1500.0) - pl.col("season_end_elo_high").fill_null(1500.0)) / 100.0)
+                .alias("diff_quality_minus_elo")
+            )
 
     return paired.with_columns(diffs)
 
@@ -1848,6 +2021,62 @@ def _validation_split_metadata(config: PipelineConfig) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Feature ablation & hyperparameter tuning utilities
+# ---------------------------------------------------------------------------
+
+def _feature_ablation_cv(training: pl.DataFrame, candidate_features: list[str],
+                         sex: str = "M", **model_kwargs: Any) -> dict[str, dict[str, float]]:
+    """Leave-one-out feature ablation using time-series CV Brier.
+
+    Returns {"feature_name": {"brier_without": float, "delta": float}} where
+    delta = brier_without - brier_all (positive = feature helps, drop hurts).
+    """
+    baseline_brier, _ = _time_series_cv_brier(training, candidate_features, sex=sex, **model_kwargs)
+    results: dict[str, dict[str, float]] = {"__baseline__": {"brier_without": baseline_brier, "delta": 0.0}}
+
+    for feat in candidate_features:
+        reduced = [f for f in candidate_features if f != feat]
+        if not reduced:
+            continue
+        feat_brier, _ = _time_series_cv_brier(training, reduced, sex=sex, **model_kwargs)
+        results[feat] = {"brier_without": feat_brier, "delta": feat_brier - baseline_brier}
+
+    return results
+
+
+def _tune_hyperparameters(training: pl.DataFrame, feature_cols: list[str],
+                          sex: str = "M") -> dict[str, Any]:
+    """Grid search over focused XGBoost hyperparameter space using time-series CV Brier."""
+    from itertools import product
+
+    param_grid = {
+        "n_estimators": [300, 500, 700],
+        "max_depth": [3, 4, 5, 6],
+        "learning_rate": [0.02, 0.04, 0.06],
+        "min_child_weight": [1, 3, 5],
+    }
+
+    keys = list(param_grid.keys())
+    best_brier = float("inf")
+    best_params: dict[str, Any] = {}
+    all_results: list[dict[str, Any]] = []
+
+    for combo in product(*[param_grid[k] for k in keys]):
+        params = dict(zip(keys, combo))
+        brier, folds = _time_series_cv_brier(training, feature_cols, sex=sex, **params)
+        all_results.append({**params, "cv_brier": brier, "folds": folds})
+        if brier < best_brier:
+            best_brier = brier
+            best_params = params
+
+    return {
+        "best_params": best_params,
+        "best_cv_brier": best_brier,
+        "all_results": sorted(all_results, key=lambda x: x["cv_brier"]),
+    }
+
+
 def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) -> dict[str, Any]:
     game_fact = _read_parquet(config.silver_dir / "game_fact.parquet")
     elo_ratings = _read_parquet(config.silver_dir / "elo_ratings.parquet")
@@ -1857,6 +2086,20 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
 
     seed_map = _load_seed_map(ingest_manifest)
     team_features = _build_team_season_features(game_fact, elo_ratings, heat_scores)
+
+    # Compute Ridge quality scores and join into team features
+    quality_scores = _compute_quality_scores(game_fact)
+    if quality_scores.height > 0:
+        team_features = team_features.join(
+            quality_scores.select("sex", "season", "team_id", "quality"),
+            on=["sex", "season", "team_id"],
+            how="left",
+        )
+    else:
+        team_features = team_features.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("quality"),
+        )
+
     pairwise_features = _pair_features_from_ids(sample.select("ID"), team_features, cbbd_line_consensus, seed_map)
     training = _build_training_pairs(ingest_manifest, team_features, config.target_season, seed_map)
 
@@ -1886,6 +2129,10 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         "diff_possessions",
         "seed_product",
         "consensus_low_spread_filled",
+        "diff_sw_heat_5g",
+        "diff_heat_volatility",
+        "diff_quality",
+        "diff_quality_minus_elo",
     ]
     # Keep only feature columns that actually exist in both training and prediction data
     available_train_cols = set(training.columns) if training.height > 0 else set()
@@ -1950,39 +2197,8 @@ def run_gold_and_model(config: PipelineConfig, ingest_manifest: dict[str, Any]) 
         pl.col("Pred").fill_null(0.5)
     )
 
-    # Monte Carlo bracket simulation
-    sim_meta: dict[str, Any] = {"simulated": False}
-    files = ingest_manifest["kaggle"]["files"]
-    prob_lookup = _build_prob_lookup(submission)
-
-    for sex, seeds_key, slots_key in [("M", "MNCAATourneySeeds", "MNCAATourneySlots"), ("W", "WNCAATourneySeeds", "WNCAATourneySlots")]:
-        if seeds_key not in files or slots_key not in files:
-            continue
-        all_seeds = _read_parquet(Path(files[seeds_key]["artifact"]))
-        all_slots = _read_parquet(Path(files[slots_key]["artifact"]))
-        target_seeds = all_seeds.filter(pl.col("Season") == config.target_season)
-        target_slots = all_slots.filter(pl.col("Season") == config.target_season)
-        if target_seeds.height == 0 or target_slots.height == 0:
-            continue
-
-        sim_preds = _simulate_bracket(target_seeds, target_slots, prob_lookup, n_sims=100_000)
-
-        if sim_preds:
-            sim_meta["simulated"] = True
-            sim_meta[f"{sex}_matchups_simulated"] = len(sim_preds)
-
-            blend_updates = [
-                {"ID": f"{config.target_season}_{t_low}_{t_high}", "sim_pred": sim_prob}
-                for (t_low, t_high), sim_prob in sim_preds.items()
-            ]
-            if blend_updates:
-                sim_df = pl.DataFrame(blend_updates)
-                submission = submission.join(sim_df, on="ID", how="left").with_columns(
-                    pl.when(pl.col("sim_pred").is_not_null())
-                    .then(pl.col("Pred") * 0.6 + pl.col("sim_pred") * 0.4)
-                    .otherwise(pl.col("Pred"))
-                    .alias("Pred")
-                ).drop("sim_pred")
+    # Simulation blending removed — pure model output (calibrated + clipped)
+    sim_meta: dict[str, Any] = {"simulated": False, "blend_applied": False}
 
     # Write outputs
     game_features = game_fact.group_by(["sex", "season", "game_key"]).agg(
